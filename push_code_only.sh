@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE_URL="${REMOTE_URL:-https://github.com/limengran98/FORGE.git}"
+REMOTE_URL="${REMOTE_URL:-git@github.com:limengran98/FORGE.git}"
 BRANCH="${BRANCH:-main}"
 COMMIT_MSG="${1:-update FORGE code}"
 
