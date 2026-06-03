@@ -1,0 +1,16 @@
+description: Ms-AeDNet-style multi-step benchmark grid.
+datasets:
+  - FC1
+  - FC2
+seq_lens:
+  - 12
+  - 24
+  - 48
+  - 96
+  - 192
+pred_lens:
+  - 1
+  - 3
+  - 6
+  - 12
+

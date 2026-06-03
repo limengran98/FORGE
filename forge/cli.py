@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -8,10 +9,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from .assets import ensure_ms_aednet_data
-from .config import load_experiment_config, save_json
+from .config import load_experiment_config, load_json, save_json
 from .feedback import encode_feedback
 from .harness import HarnessConfig, run_harness
 from .harness_spec import (
+    get_benchmark_grid,
     get_dataset_files,
     get_default_dataset_name,
     get_enc_in,
@@ -22,13 +24,28 @@ from .llm import load_llm_config
 from .model_io import read_model_source
 from .orchestrator import GraphOrchestrator
 from .patching import apply_candidate, heuristic_patch_source, request_llm_patch
-from .paths import CONFIG_DIR, INITIAL_MODEL_PATH, RUNS_DIR, ensure_project_dirs
+from .paths import CONFIG_DIR, INITIAL_MODEL_PATH, PROJECT_ROOT, RUNS_DIR, ensure_project_dirs
 from .report import write_iteration_report
 from .routing import route_feedback
 
 
 def _timestamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+
+def _device_label(cfg: HarnessConfig) -> str:
+    if cfg.device == "cuda":
+        return f"cuda:{cfg.cuda_id}"
+    return str(cfg.device)
+
+
+def _warn_if_heuristic_only(llm_mode: str, rounds: int, scope: str = "run") -> None:
+    if llm_mode == "off" and rounds > 0:
+        print(
+            f"[FORGE] WARNING: {scope} is running with --llm-mode off and --rounds {rounds}. "
+            "Model patches will come from deterministic heuristic templates, not from an LLM. "
+            "Use --llm-mode required for official LLM-agent experiments."
+        )
 
 
 def _harness_config_from_args(args: argparse.Namespace, cfg: dict[str, Any]) -> HarnessConfig:
@@ -94,7 +111,158 @@ def _history_row(iteration: int, result: dict[str, Any], route: dict[str, Any]) 
     }
 
 
-def cmd_run(args: argparse.Namespace) -> None:
+def _validation_config(hcfg: HarnessConfig) -> SimpleNamespace:
+    return SimpleNamespace(
+        seq_len=hcfg.seq_len,
+        pred_len=hcfg.pred_len,
+        enc_in=hcfg.enc_in,
+        hidden_dim=hcfg.hidden_dim,
+        layer=hcfg.layer,
+        dropout=hcfg.dropout,
+        feature_dim=get_feature_dim(),
+    )
+
+
+def _resolve_stored_path(path: str | Path, run_root: Path | None = None) -> Path:
+    resolved = Path(path).expanduser()
+    if resolved.is_absolute():
+        return resolved
+    candidates = [PROJECT_ROOT / resolved]
+    if run_root is not None:
+        candidates.append(run_root / resolved)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _generate_patch_for_next_iteration(
+    orchestrator: GraphOrchestrator,
+    current_iteration: int,
+    next_iteration: int,
+    current_model_path: Path,
+    next_dir: Path,
+    hcfg: HarnessConfig,
+    llm_mode: str,
+    feedback: dict[str, Any],
+    route: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> tuple[Path, dict[str, Any]]:
+    next_model_path = next_dir / "model.py"
+    next_dir.mkdir(parents=True, exist_ok=True)
+    previous_source = read_model_source(current_model_path)
+    candidate = None
+    if llm_mode in {"auto", "required"}:
+        try:
+            llm_cfg = load_llm_config(str(CONFIG_DIR / "forge_llm.yaml"))
+            candidate = request_llm_patch(
+                llm_cfg,
+                next_iteration,
+                feedback,
+                route,
+                previous_source,
+                history,
+            )
+        except Exception as exc:
+            if llm_mode == "required":
+                raise
+            print(f"[FORGE] LLM patch unavailable, using heuristic fallback: {exc}")
+    if candidate is None:
+        candidate = heuristic_patch_source(previous_source, route)
+
+    feature_dim = get_feature_dim()
+    try:
+        patch_meta = apply_candidate(
+            candidate,
+            current_model_path,
+            next_model_path,
+            _validation_config(hcfg),
+            feature_dim=feature_dim,
+            artifact_dir=next_dir,
+        )
+    except Exception as exc:
+        if llm_mode == "auto" and candidate.origin == "llm":
+            print(f"[FORGE] LLM patch failed validation, using heuristic fallback: {exc}")
+            candidate = heuristic_patch_source(previous_source, route)
+            patch_meta = apply_candidate(
+                candidate,
+                current_model_path,
+                next_model_path,
+                _validation_config(hcfg),
+                feature_dim=feature_dim,
+                artifact_dir=next_dir,
+            )
+        else:
+            raise
+    orchestrator.record_patch(current_iteration, patch_meta)
+    return next_model_path, patch_meta
+
+
+def _load_iteration_json(orchestrator: GraphOrchestrator, iteration: int, artifact_name: str) -> dict[str, Any]:
+    key = f"iter_{iteration:03d}"
+    path = orchestrator.state["iterations"][key].get("artifacts", {}).get(artifact_name, {}).get("path")
+    if not path:
+        raise FileNotFoundError(f"Iteration {key} has no artifact named {artifact_name}")
+    return load_json(_resolve_stored_path(path, orchestrator.run_root))
+
+
+def _write_run_summary(
+    run_root: Path,
+    rounds: int,
+    target_metric: str,
+    history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = {
+        "run_root": str(run_root),
+        "rounds": rounds,
+        "target_metric": target_metric,
+        "history": [
+            {
+                "iteration": row["iteration"],
+                "success": row["success"],
+                "target": row["target"],
+                "primary_component": row["primary_component"],
+                "run_dir": row["run_dir"],
+            }
+            for row in history
+        ],
+    }
+    best = _best_result(history, target_metric)
+    if best:
+        summary["best_target"] = best.get("metrics", {}).get("target", {}).get(target_metric)
+        summary["best_run_dir"] = best.get("run_dir")
+    save_json(summary, run_root / "summary.json")
+    return summary
+
+
+def _write_sweep_outputs(rows: list[dict[str, Any]], sweep_root: Path, target_metric: str) -> None:
+    summary = {
+        "sweep_root": str(sweep_root),
+        "target_metric": target_metric,
+        "count": len(rows),
+        "rows": rows,
+    }
+    save_json(summary, sweep_root / "sweep_summary.json")
+
+    csv_path = sweep_root / "sweep_summary.csv"
+    fieldnames = [
+        "dataset",
+        "seq_len",
+        "pred_len",
+        "success",
+        "best_target",
+        "best_run_dir",
+        "run_root",
+        "error",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     ensure_project_dirs()
     validate_harness_specs()
     ensure_ms_aednet_data()
@@ -105,7 +273,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     hcfg = _harness_config_from_args(args, exp_cfg)
 
     run_name = args.run_name or f"forge_{_timestamp()}"
-    run_root = Path(args.run_dir) if args.run_dir else RUNS_DIR / run_name
+    run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (RUNS_DIR / run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     save_json({"experiment_config": exp_cfg, "harness_config": hcfg.__dict__}, run_root / "run_config.json")
 
@@ -119,9 +287,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         shutil.copy2(INITIAL_MODEL_PATH, current_model_path)
 
     print(f"[FORGE] Run root: {run_root}")
-    print(f"[FORGE] Device: {hcfg.device}:{hcfg.cuda_id if hcfg.device == 'cuda' else ''}")
+    print(f"[FORGE] Dataset: {hcfg.data_name} | seq_len: {hcfg.seq_len} | pred_len: {hcfg.pred_len}")
+    print(f"[FORGE] Device: {_device_label(hcfg)}")
     print(f"[FORGE] LLM mode: {llm_mode}")
     print(f"[FORGE] Rounds: {rounds}")
+    if not getattr(args, "_sweep_child", False):
+        _warn_if_heuristic_only(llm_mode, rounds)
 
     for iteration in range(rounds + 1):
         iter_dir = run_root / f"iter_{iteration:03d}"
@@ -161,61 +332,18 @@ def cmd_run(args: argparse.Namespace) -> None:
             next_dir = run_root / f"iter_{iteration + 1:03d}"
             with orchestrator.stage(iteration, "patch", {"next_iteration": iteration + 1}):
                 next_dir.mkdir(parents=True, exist_ok=True)
-                previous_source = read_model_source(current_model_path)
-                candidate = None
-                if llm_mode in {"auto", "required"}:
-                    try:
-                        llm_cfg = load_llm_config(str(CONFIG_DIR / "forge_llm.yaml"))
-                        candidate = request_llm_patch(
-                            llm_cfg,
-                            iteration + 1,
-                            feedback,
-                            route,
-                            previous_source,
-                            history,
-                        )
-                    except Exception as exc:
-                        if llm_mode == "required":
-                            raise
-                        print(f"[FORGE] LLM patch unavailable, using heuristic fallback: {exc}")
-                if candidate is None:
-                    candidate = heuristic_patch_source(previous_source, route)
-
-                feature_dim = get_feature_dim()
-                validation_cfg = SimpleNamespace(
-                    seq_len=hcfg.seq_len,
-                    pred_len=hcfg.pred_len,
-                    enc_in=hcfg.enc_in,
-                    hidden_dim=hcfg.hidden_dim,
-                    layer=hcfg.layer,
-                    dropout=hcfg.dropout,
-                    feature_dim=feature_dim,
+                current_model_path, patch_meta = _generate_patch_for_next_iteration(
+                    orchestrator,
+                    iteration,
+                    iteration + 1,
+                    current_model_path,
+                    next_dir,
+                    hcfg,
+                    llm_mode,
+                    feedback,
+                    route,
+                    history,
                 )
-                try:
-                    patch_meta = apply_candidate(
-                        candidate,
-                        current_model_path,
-                        next_dir / "model.py",
-                        validation_cfg,
-                        feature_dim=feature_dim,
-                        artifact_dir=next_dir,
-                    )
-                except Exception as exc:
-                    if llm_mode == "auto" and candidate.origin == "llm":
-                        print(f"[FORGE] LLM patch failed validation, using heuristic fallback: {exc}")
-                        candidate = heuristic_patch_source(previous_source, route)
-                        patch_meta = apply_candidate(
-                            candidate,
-                            current_model_path,
-                            next_dir / "model.py",
-                            validation_cfg,
-                            feature_dim=feature_dim,
-                            artifact_dir=next_dir,
-                        )
-                    else:
-                        raise
-                orchestrator.record_patch(iteration, patch_meta)
-                current_model_path = next_dir / "model.py"
         else:
             orchestrator.skip_stage(iteration, "patch", "final_iteration")
 
@@ -225,27 +353,219 @@ def cmd_run(args: argparse.Namespace) -> None:
             orchestrator.record_artifact(iteration, "report", report_path)
         orchestrator.finish_iteration(iteration)
 
-    summary = {
-        "run_root": str(run_root),
-        "rounds": rounds,
-        "target_metric": target_metric,
-        "history": [
-            {
-                "iteration": row["iteration"],
-                "success": row["success"],
-                "target": row["target"],
-                "primary_component": row["primary_component"],
-                "run_dir": row["run_dir"],
-            }
-            for row in history
-        ],
-    }
-    best = _best_result(history, target_metric)
-    if best:
-        summary["best_target"] = best.get("metrics", {}).get("target", {}).get(target_metric)
-        summary["best_run_dir"] = best.get("run_dir")
-    save_json(summary, run_root / "summary.json")
+    summary = _write_run_summary(run_root, rounds, target_metric, history)
     print(f"[FORGE] Finished. Summary: {run_root / 'summary.json'}")
+    return summary
+
+
+def _load_continue_run(args: argparse.Namespace) -> tuple[Path, dict[str, Any], HarnessConfig, str, str]:
+    run_root = Path(args.run_dir).expanduser().resolve()
+    run_config_path = run_root / "run_config.json"
+    if not run_config_path.exists():
+        raise FileNotFoundError(f"Cannot continue; missing {run_config_path}")
+    run_config = load_json(run_config_path)
+    exp_cfg = run_config.get("experiment_config") or load_experiment_config(args.experiment_config)
+    hcfg = HarnessConfig(**run_config["harness_config"])
+
+    for attr in ("epochs", "batch_size", "lr", "patience", "seed", "device", "cuda_id"):
+        value = getattr(args, attr, None)
+        if value is not None:
+            setattr(hcfg, attr, value)
+
+    target_metric = args.target_metric or exp_cfg["evolution"]["target_metric"]
+    llm_mode = args.llm_mode or exp_cfg["evolution"]["llm_mode"]
+    return run_root, exp_cfg, hcfg, target_metric, llm_mode
+
+
+def _resolve_continue_target(args: argparse.Namespace, last_iteration: int) -> int:
+    if args.to_round is not None and args.additional_rounds is not None:
+        raise ValueError("Use either --to-round or --additional-rounds, not both")
+    if args.to_round is not None:
+        target = int(args.to_round)
+    elif args.additional_rounds is not None:
+        target = last_iteration + int(args.additional_rounds)
+    else:
+        target = last_iteration + 1
+    if target <= last_iteration:
+        raise ValueError(f"Continuation target must be greater than last completed iteration {last_iteration}")
+    return target
+
+
+def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_project_dirs()
+    validate_harness_specs()
+    ensure_ms_aednet_data()
+
+    run_root, _exp_cfg, hcfg, target_metric, llm_mode = _load_continue_run(args)
+    orchestrator = GraphOrchestrator.open(run_root)
+    history = orchestrator.history_rows(target_metric)
+    if not history:
+        raise RuntimeError(f"No completed iterations found in {run_root}")
+    last_iteration = history[-1]["iteration"]
+    to_round = _resolve_continue_target(args, last_iteration)
+
+    print(f"[FORGE] Continue run root: {run_root}")
+    print(f"[FORGE] Dataset: {hcfg.data_name} | seq_len: {hcfg.seq_len} | pred_len: {hcfg.pred_len}")
+    print(f"[FORGE] Device: {_device_label(hcfg)}")
+    print(f"[FORGE] LLM mode: {llm_mode}")
+    print(f"[FORGE] Continuing from iter_{last_iteration:03d} to iter_{to_round:03d}")
+    _warn_if_heuristic_only(llm_mode, to_round - last_iteration, scope="continue")
+    orchestrator.event(
+        "continue_started",
+        {"from_iteration": last_iteration, "to_round": to_round, "llm_mode": llm_mode},
+    )
+    orchestrator.save()
+
+    current_iteration = last_iteration
+    while current_iteration < to_round:
+        current_key = f"iter_{current_iteration:03d}"
+        current_record = orchestrator.state["iterations"][current_key]
+        current_model_path = _resolve_stored_path(
+            current_record.get("artifacts", {}).get("model", {}).get("path")
+            or current_record.get("model_path")
+            or run_root / current_key / "model.py",
+            run_root,
+        )
+        result = _load_iteration_json(orchestrator, current_iteration, "result")
+        feedback = _load_iteration_json(orchestrator, current_iteration, "feedback_vector")
+        route = _load_iteration_json(orchestrator, current_iteration, "routing")
+
+        next_iteration = current_iteration + 1
+        next_dir = run_root / f"iter_{next_iteration:03d}"
+        patch_stage = current_record.get("stages", {}).get("patch", {})
+        patch_record = current_record.get("patch", {})
+        existing_next_model = patch_record.get("output_model_path")
+        patch_meta = None
+        existing_next_model_path = _resolve_stored_path(existing_next_model, run_root) if existing_next_model else None
+        if patch_stage.get("status") == "succeeded" and existing_next_model_path and existing_next_model_path.exists():
+            next_model_path = existing_next_model_path
+            print(f"[FORGE] Reusing existing patch for iter_{current_iteration:03d} -> iter_{next_iteration:03d}")
+        else:
+            with orchestrator.stage(current_iteration, "patch", {"next_iteration": next_iteration, "resume": True}):
+                next_model_path, patch_meta = _generate_patch_for_next_iteration(
+                    orchestrator,
+                    current_iteration,
+                    next_iteration,
+                    current_model_path,
+                    next_dir,
+                    hcfg,
+                    llm_mode,
+                    feedback,
+                    route,
+                    history,
+                )
+            with orchestrator.stage(current_iteration, "report", {"resume": True, "patch_refresh": True}):
+                report_path = run_root / current_key / "report.md"
+                write_iteration_report(report_path, current_iteration, result, feedback, route, patch_meta)
+                orchestrator.record_artifact(current_iteration, "report", report_path)
+            orchestrator.finish_iteration(current_iteration)
+
+        orchestrator.ensure_iteration(next_iteration, next_dir, next_model_path)
+        with orchestrator.stage(next_iteration, "prepare", {"iter_dir": str(next_dir), "resume": True}):
+            next_dir.mkdir(parents=True, exist_ok=True)
+            if not (next_dir / "model.py").exists():
+                shutil.copy2(next_model_path, next_dir / "model.py")
+                next_model_path = next_dir / "model.py"
+            orchestrator.record_artifact(next_iteration, "model", next_model_path, kind="python_source")
+
+        print(f"[FORGE] Iteration {next_iteration:03d}: training and evaluating {next_model_path}")
+        with orchestrator.stage(next_iteration, "evaluate", {"model_path": str(next_model_path), "resume": True}):
+            next_result = run_harness(next_model_path, next_dir, hcfg)
+            orchestrator.record_result(next_iteration, next_result)
+
+        previous_result = history[-1]["result"]
+        best_before = _best_result(history, target_metric)
+        with orchestrator.stage(next_iteration, "feedback", {"target_metric": target_metric, "resume": True}):
+            next_feedback = encode_feedback(next_result, previous_result, best_before, target_metric=target_metric)
+            feedback_path = next_dir / "feedback_vector.json"
+            save_json(next_feedback, feedback_path)
+            orchestrator.record_artifact(next_iteration, "feedback_vector", feedback_path)
+
+        with orchestrator.stage(next_iteration, "route", {"resume": True}):
+            next_route = route_feedback(next_feedback)
+            route_path = next_dir / "routing.json"
+            save_json(next_route, route_path)
+            orchestrator.record_artifact(next_iteration, "routing", route_path)
+            orchestrator.record_feedback_and_route(next_iteration, next_feedback, next_route, next_result)
+
+        history.append(_history_row(next_iteration, next_result, next_route))
+        if next_iteration == to_round:
+            orchestrator.skip_stage(next_iteration, "patch", "final_iteration")
+
+        with orchestrator.stage(next_iteration, "report", {"resume": True}):
+            report_path = next_dir / "report.md"
+            write_iteration_report(report_path, next_iteration, next_result, next_feedback, next_route, None)
+            orchestrator.record_artifact(next_iteration, "report", report_path)
+        orchestrator.finish_iteration(next_iteration)
+        current_iteration = next_iteration
+
+    summary = _write_run_summary(run_root, to_round, target_metric, history)
+    orchestrator.event("continue_finished", {"to_round": to_round})
+    orchestrator.save()
+    print(f"[FORGE] Continue finished. Summary: {run_root / 'summary.json'}")
+    return summary
+
+
+def cmd_sweep(args: argparse.Namespace) -> None:
+    ensure_project_dirs()
+    validate_harness_specs()
+    ensure_ms_aednet_data()
+
+    grid = get_benchmark_grid()
+    datasets = args.datasets or grid["datasets"]
+    seq_lens = args.seq_lens or grid["seq_lens"]
+    pred_lens = args.pred_lens or grid["pred_lens"]
+
+    exp_cfg = load_experiment_config(args.experiment_config)
+    target_metric = args.target_metric or exp_cfg["evolution"]["target_metric"]
+    rounds = int(args.rounds if args.rounds is not None else exp_cfg["evolution"]["rounds"])
+    llm_mode = args.llm_mode or exp_cfg["evolution"]["llm_mode"]
+    sweep_name = args.run_name or f"forge_sweep_{_timestamp()}"
+    sweep_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (RUNS_DIR / sweep_name).resolve()
+    sweep_root.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, Any]] = []
+    print(f"[FORGE] Sweep root: {sweep_root}")
+    print(f"[FORGE] Sweep datasets: {datasets}")
+    print(f"[FORGE] Sweep seq_lens: {seq_lens}")
+    print(f"[FORGE] Sweep pred_lens: {pred_lens}")
+    print(f"[FORGE] Sweep LLM mode: {llm_mode} | rounds: {rounds}")
+    _warn_if_heuristic_only(llm_mode, rounds, scope="sweep")
+
+    for dataset in datasets:
+        for seq_len in seq_lens:
+            for pred_len in pred_lens:
+                combo_name = f"{dataset}_L{seq_len}_P{pred_len}"
+                combo_args = argparse.Namespace(**vars(args))
+                combo_args.data = dataset
+                combo_args.seq_len = int(seq_len)
+                combo_args.pred_len = int(pred_len)
+                combo_args.run_dir = str(sweep_root / combo_name)
+                combo_args.run_name = None
+                combo_args._sweep_child = True
+                print(f"[FORGE] Sweep combo: {combo_name}")
+                row = {
+                    "dataset": dataset,
+                    "seq_len": int(seq_len),
+                    "pred_len": int(pred_len),
+                    "success": False,
+                    "best_target": None,
+                    "best_run_dir": None,
+                    "run_root": combo_args.run_dir,
+                    "error": None,
+                }
+                try:
+                    summary = cmd_run(combo_args)
+                    row["success"] = True
+                    row["best_target"] = summary.get("best_target")
+                    row["best_run_dir"] = summary.get("best_run_dir")
+                except Exception as exc:
+                    row["error"] = f"{type(exc).__name__}: {exc}"
+                    print(f"[FORGE] Sweep combo failed: {combo_name}: {row['error']}")
+                rows.append(row)
+                _write_sweep_outputs(rows, sweep_root, target_metric)
+
+    print(f"[FORGE] Sweep finished. Summary: {sweep_root / 'sweep_summary.json'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -279,6 +599,52 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--layer", type=int, default=None)
     run_p.add_argument("--dropout", type=float, default=None)
     run_p.set_defaults(func=cmd_run)
+
+    continue_p = sub.add_parser("continue", help="continue an existing run from its last completed iteration")
+    continue_p.add_argument("--experiment-config", default=str(CONFIG_DIR / "forge_experiment.yaml"))
+    continue_p.add_argument("--run-dir", required=True)
+    continue_p.add_argument("--to-round", type=int, default=None, help="absolute final iteration index to reach")
+    continue_p.add_argument(
+        "--additional-rounds",
+        type=int,
+        default=None,
+        help="number of new evolution rounds to add after the last completed iteration",
+    )
+    continue_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
+    continue_p.add_argument("--target-metric", default=None)
+    continue_p.add_argument("--epochs", type=int, default=None)
+    continue_p.add_argument("--batch-size", type=int, default=None)
+    continue_p.add_argument("--lr", type=float, default=None)
+    continue_p.add_argument("--patience", type=int, default=None)
+    continue_p.add_argument("--seed", type=int, default=None)
+    continue_p.add_argument("--device", choices=["cuda", "cpu", "auto"], default=None)
+    continue_p.add_argument("--cuda-id", type=int, default=None)
+    continue_p.set_defaults(func=cmd_continue)
+
+    sweep_p = sub.add_parser("sweep", help="run benchmark grid over datasets, history lengths, and horizons")
+    sweep_p.add_argument("--experiment-config", default=str(CONFIG_DIR / "forge_experiment.yaml"))
+    sweep_p.add_argument("--run-dir", default=None)
+    sweep_p.add_argument("--run-name", default=None)
+    sweep_p.add_argument("--rounds", type=int, default=None)
+    sweep_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
+    sweep_p.add_argument("--target-metric", default=None)
+    sweep_p.add_argument("--datasets", nargs="+", choices=sorted(get_dataset_files()), default=None)
+    sweep_p.add_argument("--seq-lens", nargs="+", type=int, default=None)
+    sweep_p.add_argument("--pred-lens", nargs="+", type=int, default=None)
+    sweep_p.add_argument("--data-path", default=None)
+    sweep_p.add_argument("--scaling", choices=["baseline", "train"], default=None)
+    sweep_p.add_argument("--limit-rows", type=int, default=None)
+    sweep_p.add_argument("--epochs", type=int, default=None)
+    sweep_p.add_argument("--batch-size", type=int, default=None)
+    sweep_p.add_argument("--lr", type=float, default=None)
+    sweep_p.add_argument("--patience", type=int, default=None)
+    sweep_p.add_argument("--seed", type=int, default=None)
+    sweep_p.add_argument("--device", choices=["cuda", "cpu", "auto"], default=None)
+    sweep_p.add_argument("--cuda-id", type=int, default=None)
+    sweep_p.add_argument("--hidden-dim", type=int, default=None)
+    sweep_p.add_argument("--layer", type=int, default=None)
+    sweep_p.add_argument("--dropout", type=float, default=None)
+    sweep_p.set_defaults(func=cmd_sweep)
 
     return parser
 

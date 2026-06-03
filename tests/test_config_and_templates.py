@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from forge.config import load_experiment_config
 from forge.harness import _resolve_device, validate_harness_config
-from forge.harness_spec import get_enc_in, get_feature_dim, validate_harness_specs
+from forge.harness_spec import get_benchmark_grid, get_enc_in, get_feature_dim, validate_harness_specs
 from forge.model_io import validate_model_source
 from forge.patching import heuristic_patch_source
 
@@ -15,6 +15,13 @@ def test_default_device_is_cuda_zero():
 
 def test_harness_specs_are_self_consistent():
     validate_harness_specs()
+
+
+def test_benchmark_grid_matches_table_protocol():
+    grid = get_benchmark_grid()
+    assert grid["datasets"] == ["FC1", "FC2"]
+    assert grid["seq_lens"] == [12, 24, 48, 96, 192]
+    assert grid["pred_lens"] == [1, 3, 6, 12]
 
 
 def test_cpu_device_resolution_is_explicit():

@@ -109,6 +109,24 @@ class GraphOrchestrator:
         self.state["updated_at"] = _now()
         save_json(self.state, self.graph_path)
 
+    def _resolve_artifact_path(self, path: str | Path) -> Path:
+        artifact_path = Path(path).expanduser()
+        if artifact_path.is_absolute():
+            return artifact_path
+
+        candidates: list[Path] = []
+        parts = artifact_path.parts
+        if self.run_root.name in parts:
+            index = parts.index(self.run_root.name)
+            suffix = Path(*parts[index + 1 :]) if index + 1 < len(parts) else Path()
+            candidates.append(self.run_root / suffix)
+        candidates.extend([self.run_root / artifact_path, Path.cwd() / artifact_path])
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return candidates[0].resolve()
+
     def event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
         row = {
             "ts": _now(),
@@ -321,9 +339,12 @@ class GraphOrchestrator:
         for key in sorted(self.state.get("iterations", {})):
             record = self.state["iterations"][key]
             result_path = record.get("artifacts", {}).get("result", {}).get("path")
-            if not result_path or not Path(result_path).exists():
+            if not result_path:
                 continue
-            result = load_json(result_path)
+            resolved_result_path = self._resolve_artifact_path(result_path)
+            if not resolved_result_path.exists():
+                continue
+            result = load_json(resolved_result_path)
             route = record.get("route", {})
             target = result.get("metrics", {}).get("target", {}) if result.get("success") else {}
             rows.append(

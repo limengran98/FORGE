@@ -1,6 +1,6 @@
 import pytest
 
-from forge.config import load_json
+from forge.config import load_json, save_json
 from forge.orchestrator import GraphOrchestrator
 
 
@@ -48,3 +48,31 @@ def test_orchestrator_rejects_unknown_stage(tmp_path):
         with orch.stage(0, "unknown"):
             pass
     assert "Unknown orchestration stage" in str(exc_info.value)
+
+
+def test_history_rows_resolves_legacy_relative_artifact_paths(tmp_path):
+    run_root = tmp_path / "demo_run"
+    orch = GraphOrchestrator.open(run_root)
+    iter_dir = run_root / "iter_000"
+    result_path = iter_dir / "result.json"
+    iter_dir.mkdir(parents=True)
+    save_json(
+        {
+            "success": True,
+            "metrics": {"target": {"mae_inverse": 0.1}},
+            "run_dir": str(iter_dir),
+        },
+        result_path,
+    )
+
+    orch.ensure_iteration(0, iter_dir)
+    record = orch.state["iterations"]["iter_000"]
+    record["artifacts"]["result"] = {
+        "path": f"legacy/prefix/{run_root.name}/iter_000/result.json",
+        "kind": "file",
+    }
+    orch.save()
+
+    rows = orch.history_rows("mae_inverse")
+    assert rows[0]["iteration"] == 0
+    assert rows[0]["target_metric_value"] == 0.1

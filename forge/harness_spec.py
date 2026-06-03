@@ -46,6 +46,11 @@ def load_orchestration_spec() -> dict[str, Any]:
     return _load_named_yaml("orchestration.yaml")
 
 
+@lru_cache(maxsize=1)
+def load_benchmark_grid_spec() -> dict[str, Any]:
+    return _load_named_yaml("benchmark_grid.yaml")
+
+
 def get_dataset_files() -> dict[str, str]:
     datasets = load_pemfc_harness_spec().get("datasets", {})
     out = {}
@@ -160,6 +165,22 @@ def get_iteration_stages() -> list[str]:
     return out
 
 
+def get_benchmark_grid() -> dict[str, list[int] | list[str]]:
+    spec = load_benchmark_grid_spec()
+    datasets = [str(name).upper() for name in spec.get("datasets", [])]
+    seq_lens = [int(value) for value in spec.get("seq_lens", [])]
+    pred_lens = [int(value) for value in spec.get("pred_lens", [])]
+    if not datasets or not seq_lens or not pred_lens:
+        raise ValueError("benchmark_grid.yaml must define datasets, seq_lens, and pred_lens")
+    known = set(get_dataset_files())
+    unknown = [name for name in datasets if name not in known]
+    if unknown:
+        raise ValueError(f"benchmark_grid.yaml references unknown datasets: {unknown}")
+    if any(value < 1 for value in seq_lens + pred_lens):
+        raise ValueError("benchmark seq_lens and pred_lens must be positive")
+    return {"datasets": datasets, "seq_lens": seq_lens, "pred_lens": pred_lens}
+
+
 def validate_harness_specs() -> None:
     dataset_files = get_dataset_files()
     if get_default_dataset_name() not in dataset_files:
@@ -188,6 +209,7 @@ def validate_harness_specs() -> None:
 
     get_component_graph()
     get_iteration_stages()
+    get_benchmark_grid()
 
     for rule in get_heuristic_patch_rules():
         template = rule.get("template")

@@ -21,6 +21,18 @@ python -m forge.cli init
 python -m forge.cli run --rounds 1 --epochs 5 --batch-size 64 --llm-mode off
 ```
 
+`--llm-mode off` is for smoke tests and harness debugging only. In this mode,
+FORGE generates the next model from deterministic fallback templates in
+`skills/forge_model_templates/`; it does not call an LLM.
+
+By default, `run` uses the harness default dataset `FC2`, `seq_len=24`, and
+`pred_len=12`. A single Table-style setting is selected explicitly with:
+
+```bash
+python -m forge.cli run --data FC1 --seq-len 96 --pred-len 12
+python -m forge.cli run --data FC2 --seq-len 24 --pred-len 6
+```
+
 The default device is `cuda:0`. Select a different GPU or force CPU with:
 
 ```bash
@@ -31,16 +43,64 @@ python -m forge.cli run --device cpu
 Use the configured LLM:
 
 ```bash
-python -m forge.cli run --rounds 2 --epochs 200 --llm-mode auto
+python -m forge.cli run --rounds 2 --epochs 200 --llm-mode required
 ```
 
 The LLM config is at `configs/forge_llm.yaml`.
+
+## Continue Iterations
+
+`run --rounds 1` creates and evaluates `iter_000` and `iter_001`. To keep
+improving that same run, continue from the last completed iteration instead of
+starting over:
+
+```bash
+python -m forge.cli continue --run-dir runs/<run_name> --additional-rounds 1 --epochs 200 --llm-mode required
+```
+
+You can also target an absolute iteration index:
+
+```bash
+python -m forge.cli continue --run-dir runs/<run_name> --to-round 3 --epochs 200 --llm-mode required
+```
+
+`--additional-rounds 1` means "add one more patch/evaluation after the current
+last iteration." `--to-round 3` means "finish at `iter_003`." The command reuses
+the existing `run_config.json`, model code, feedback vectors, routing records,
+task graph, and patch artifacts. It only generates the missing next patch and
+then evaluates the next model.
+
+## Benchmark Grid
+
+The Ms-AeDNet-style benchmark grid is configured in
+`configs/harness/benchmark_grid.yaml`:
+
+- datasets: `FC1`, `FC2`
+- historical lengths: `12, 24, 48, 96, 192`
+- prediction lengths: `1, 3, 6, 12`
+
+Run the full grid:
+
+```bash
+python -m forge.cli sweep --rounds 1 --epochs 200 --llm-mode required
+```
+
+Run a small subset:
+
+```bash
+python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 48 --pred-lens 6 12 --epochs 20 --llm-mode required
+```
+
+Sweep outputs are saved under `runs/<sweep_name>/` as `sweep_summary.json` and
+`sweep_summary.csv`, with each combination stored in its own run directory.
+
 
 ## Flexible Harness Files
 
 Most FORGE protocol constants live outside Python:
 
 - `configs/harness/pemfc_harness.yaml`: datasets, feature columns, split ratios, model interface
+- `configs/harness/benchmark_grid.yaml`: dataset/history/horizon benchmark combinations
 - `configs/harness/feedback_schema.yaml`: feedback vector schema
 - `configs/harness/routing_graph.yaml`: component graph
 - `configs/harness/routing_policy.yaml`: routing thresholds, weights, and reason text
