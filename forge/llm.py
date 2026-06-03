@@ -30,7 +30,11 @@ def _chat_url(base_url: str) -> str:
     base = (base_url or "").rstrip("/")
     if base.endswith("/chat/completions"):
         return base
-    return base + "/chat/completions"
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    # Most hosted OpenAI-compatible gateways expose chat completions under /v1.
+    # Keeping this normalization here makes configs provider-agnostic.
+    return base + "/v1/chat/completions"
 
 
 def _strip_think(text: str) -> str:
@@ -104,4 +108,3 @@ def chat_json(messages: list[dict[str, str]], llm_config: dict[str, Any]) -> dic
             last_error = exc
             time.sleep(1.0 + attempt)
     raise RuntimeError(f"LLM JSON request failed after retries: {last_error}")
-

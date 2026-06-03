@@ -1,7 +1,6 @@
 provider: yizhan
 model: gpt-5.4-nano
-base_url: https://vip.yi-zhan.top
+base_url: https://vip.yi-zhan.top/v1
 api_key: "REPLACE_WITH_YOUR_API_KEY"
 temperature: 0.2
 max_tokens: 4096
-
