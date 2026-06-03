@@ -11,8 +11,6 @@ import torch
 
 from .harness_spec import get_model_class_name
 
-MODEL_CLASS_NAME = "ForgeModel"
-
 
 class ModelInterfaceError(RuntimeError):
     pass
@@ -40,6 +38,7 @@ def load_model_class_from_file(path: str | Path, class_name: str | None = None) 
 
 
 def instantiate_model(path: str | Path, configs: Any, class_name: str | None = None) -> torch.nn.Module:
+    class_name = class_name or get_model_class_name()
     cls = load_model_class_from_file(path, class_name)
     model = cls(configs)
     if not isinstance(model, torch.nn.Module):

@@ -29,3 +29,8 @@ def test_cold_start_success_routes_to_factor_or_regularization():
     route = route_feedback(feedback)
     assert "factor_fusion" in route["active_components"]
 
+
+def test_routing_always_includes_primary_component():
+    feedback = {"features": {"run_success": 1.0}}
+    route = route_feedback(feedback)
+    assert route["primary_component"] in route["active_components"]

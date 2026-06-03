@@ -20,10 +20,13 @@ def ensure_ms_aednet_data(data_root: str | Path | None = None) -> dict[str, Path
     dataset_files = get_dataset_files()
     archive_prefix = get_archive_input_prefix().rstrip("/")
     with zipfile.ZipFile(MS_AEDNET_ZIP) as zf:
+        archive_names = set(zf.namelist())
         for data_name, filename in dataset_files.items():
             target = input_dir / filename
             if not target.exists():
                 member = f"{archive_prefix}/{filename}"
+                if member not in archive_names:
+                    raise FileNotFoundError(f"Missing {member} inside {MS_AEDNET_ZIP}")
                 with zf.open(member) as src, target.open("wb") as dst:
                     dst.write(src.read())
             paths[data_name] = target

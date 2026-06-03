@@ -1,5 +1,5 @@
 data:
-  name: FC2
+  name:
   seq_len: 24
   pred_len: 12
   scaling: baseline
@@ -16,7 +16,6 @@ harness:
   num_workers: 0
 
 model:
-  enc_in: 5
   hidden_dim: 256
   layer: 2
   dropout: 0.1

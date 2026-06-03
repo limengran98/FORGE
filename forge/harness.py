@@ -15,8 +15,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from .config import save_json
 from .data import load_pemfc_data
-from .harness_spec import get_default_dataset_name
+from .harness_spec import get_default_dataset_name, get_enc_in
 from .metrics import metric_dict
 from .model_io import instantiate_model
 
@@ -29,7 +30,7 @@ class HarnessConfig:
     pred_len: int = 12
     scaling: str = "baseline"
     limit_rows: int | None = None
-    enc_in: int = 5
+    enc_in: int = field(default_factory=get_enc_in)
     hidden_dim: int = 256
     layer: int = 2
     dropout: float = 0.1
@@ -53,15 +54,31 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
-def _write_json(data: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False, default=_json_default)
-
-
 def _append_jsonl(row: dict[str, Any], path: Path) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
+
+
+def validate_harness_config(cfg: HarnessConfig) -> None:
+    positive_ints = {
+        "seq_len": cfg.seq_len,
+        "pred_len": cfg.pred_len,
+        "batch_size": cfg.batch_size,
+        "epochs": cfg.epochs,
+        "patience": cfg.patience,
+        "hidden_dim": cfg.hidden_dim,
+        "layer": cfg.layer,
+        "enc_in": cfg.enc_in,
+    }
+    bad = [name for name, value in positive_ints.items() if int(value) < 1]
+    if bad:
+        raise ValueError(f"Harness config values must be positive integers: {bad}")
+    if cfg.lr <= 0:
+        raise ValueError("Harness learning rate must be positive")
+    if not (0.0 <= cfg.dropout < 1.0):
+        raise ValueError("Harness dropout must be in [0, 1)")
+    if cfg.limit_rows is not None and cfg.limit_rows < 1:
+        raise ValueError("limit_rows must be positive when provided")
 
 
 def _resolve_device(device_name: str, cuda_id: int = 0) -> torch.device:
@@ -80,6 +97,13 @@ def _resolve_device(device_name: str, cuda_id: int = 0) -> torch.device:
     if name.startswith("cuda:"):
         if not torch.cuda.is_available():
             raise RuntimeError(f"{device_name} was requested but torch.cuda.is_available() is False")
+        try:
+            requested_id = int(name.split(":", 1)[1])
+        except ValueError as exc:
+            raise ValueError(f"Invalid CUDA device name: {device_name}") from exc
+        count = torch.cuda.device_count()
+        if requested_id < 0 or (count and requested_id >= count):
+            raise RuntimeError(f"CUDA device index {requested_id} is unavailable; visible device count is {count}")
         return torch.device(name)
     raise ValueError("device must be one of: cuda, cpu, auto, cuda:<id>")
 
@@ -92,7 +116,7 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _categorize_exception(exc: BaseException) -> str:
+def _categorize_exception(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}".lower()
     if "cuda out of memory" in text or "outofmemory" in text:
         return "oom"
@@ -141,6 +165,7 @@ def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig)
     }
 
     try:
+        validate_harness_config(cfg)
         _set_seed(cfg.seed)
         pemfc = load_pemfc_data(
             data_name=cfg.data_name,
@@ -310,7 +335,7 @@ def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig)
             "mape_inverse": metrics["inverse"]["mape"],
             "mae_normalized": metrics["normalized"]["mae"],
         }
-        _write_json(metrics, metrics_path)
+        save_json(metrics, metrics_path)
 
         result.update(
             {
@@ -322,7 +347,7 @@ def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig)
                 "cuda_id": cfg.cuda_id,
             }
         )
-    except BaseException as exc:
+    except Exception as exc:
         result.update(
             {
                 "success": False,
@@ -333,5 +358,5 @@ def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig)
             }
         )
 
-    _write_json(result, result_path)
+    save_json(result, result_path)
     return result

@@ -8,7 +8,12 @@ from types import SimpleNamespace
 from typing import Any
 
 from .config import load_yaml, save_json
-from .harness_spec import get_heuristic_patch_rules, load_pemfc_harness_spec, resolve_project_path
+from .harness_spec import (
+    get_heuristic_patch_rules,
+    get_model_class_name,
+    load_pemfc_harness_spec,
+    resolve_project_path,
+)
 from .llm import chat_json
 from .model_io import read_model_source, validate_model_source
 from .paths import PROMPTS_DIR
@@ -31,7 +36,7 @@ def _load_template_source(template_path: str) -> str:
     return path.read_text(encoding="utf-8").strip() + "\n"
 
 
-def heuristic_patch_source(previous_source: str, route: dict[str, Any]) -> PatchCandidate:
+def heuristic_patch_source(_previous_source: str, route: dict[str, Any]) -> PatchCandidate:
     component = route.get("primary_component", "factor_fusion")
     selected = None
     fallback = None
@@ -44,6 +49,8 @@ def heuristic_patch_source(previous_source: str, route: dict[str, Any]) -> Patch
             break
     if selected is None:
         selected = fallback or get_heuristic_patch_rules()[0]
+    if not selected.get("template"):
+        raise ValueError(f"Heuristic patch rule {selected.get('name')} must define template")
     source = _load_template_source(str(selected["template"]))
     return PatchCandidate(
         source=source,
@@ -105,8 +112,9 @@ def request_llm_patch(
     ]
     response = chat_json(messages, llm_config)
     source = response.get("full_source") or response.get("source") or ""
-    if not isinstance(source, str) or "class ForgeModel" not in source:
-        raise ValueError("LLM response must include full_source defining class ForgeModel")
+    class_name = get_model_class_name()
+    if not isinstance(source, str) or f"class {class_name}" not in source:
+        raise ValueError(f"LLM response must include full_source defining class {class_name}")
     return PatchCandidate(
         source=source.strip() + "\n",
         rationale=str(response.get("rationale", "")),

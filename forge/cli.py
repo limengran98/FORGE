@@ -11,7 +11,13 @@ from .assets import ensure_ms_aednet_data
 from .config import load_experiment_config, save_json
 from .feedback import encode_feedback
 from .harness import HarnessConfig, run_harness
-from .harness_spec import get_dataset_files, get_default_dataset_name, get_enc_in, get_feature_dim
+from .harness_spec import (
+    get_dataset_files,
+    get_default_dataset_name,
+    get_enc_in,
+    get_feature_dim,
+    validate_harness_specs,
+)
 from .llm import load_llm_config
 from .model_io import read_model_source
 from .orchestrator import GraphOrchestrator
@@ -29,22 +35,26 @@ def _harness_config_from_args(args: argparse.Namespace, cfg: dict[str, Any]) -> 
     data_cfg = cfg["data"]
     harness_cfg = cfg["harness"]
     model_cfg = cfg["model"]
+
+    def choose(cli_value: Any, cfg_value: Any) -> Any:
+        return cli_value if cli_value is not None else cfg_value
+
     return HarnessConfig(
         data_name=args.data or data_cfg.get("name") or get_default_dataset_name(),
         data_path=args.data_path,
-        seq_len=int(args.seq_len or data_cfg["seq_len"]),
-        pred_len=int(args.pred_len or data_cfg["pred_len"]),
+        seq_len=int(choose(args.seq_len, data_cfg["seq_len"])),
+        pred_len=int(choose(args.pred_len, data_cfg["pred_len"])),
         scaling=str(args.scaling or data_cfg["scaling"]),
         limit_rows=args.limit_rows if args.limit_rows is not None else data_cfg.get("limit_rows"),
-        enc_in=int(model_cfg.get("enc_in", get_enc_in())),
-        hidden_dim=int(args.hidden_dim or model_cfg["hidden_dim"]),
-        layer=int(args.layer or model_cfg["layer"]),
+        enc_in=int(model_cfg.get("enc_in") or get_enc_in()),
+        hidden_dim=int(choose(args.hidden_dim, model_cfg["hidden_dim"])),
+        layer=int(choose(args.layer, model_cfg["layer"])),
         dropout=float(args.dropout if args.dropout is not None else model_cfg["dropout"]),
-        batch_size=int(args.batch_size or harness_cfg["batch_size"]),
-        lr=float(args.lr or harness_cfg["lr"]),
-        epochs=int(args.epochs or harness_cfg["epochs"]),
-        patience=int(args.patience or harness_cfg["patience"]),
-        seed=int(args.seed or harness_cfg["seed"]),
+        batch_size=int(choose(args.batch_size, harness_cfg["batch_size"])),
+        lr=float(choose(args.lr, harness_cfg["lr"])),
+        epochs=int(choose(args.epochs, harness_cfg["epochs"])),
+        patience=int(choose(args.patience, harness_cfg["patience"])),
+        seed=int(choose(args.seed, harness_cfg["seed"])),
         device=str(args.device or harness_cfg["device"]),
         cuda_id=int(args.cuda_id if args.cuda_id is not None else harness_cfg.get("cuda_id", 0)),
         num_workers=int(harness_cfg.get("num_workers", 0)),
@@ -53,6 +63,7 @@ def _harness_config_from_args(args: argparse.Namespace, cfg: dict[str, Any]) -> 
 
 def cmd_init(args: argparse.Namespace) -> None:
     ensure_project_dirs()
+    validate_harness_specs()
     paths = ensure_ms_aednet_data()
     print("[FORGE] Initialized project directories.")
     for name, path in paths.items():
@@ -85,6 +96,7 @@ def _history_row(iteration: int, result: dict[str, Any], route: dict[str, Any]) 
 
 def cmd_run(args: argparse.Namespace) -> None:
     ensure_project_dirs()
+    validate_harness_specs()
     ensure_ms_aednet_data()
     exp_cfg = load_experiment_config(args.experiment_config)
     target_metric = args.target_metric or exp_cfg["evolution"]["target_metric"]

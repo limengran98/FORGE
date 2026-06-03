@@ -4,6 +4,7 @@ from typing import Any
 
 from .harness_spec import get_component_graph, get_routing_policy
 
+
 def _policy_value(policy: dict[str, Any], group: str, key: str, default: float) -> float:
     try:
         return float(policy.get(group, {}).get(key, default))
@@ -76,6 +77,8 @@ def route_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
     top_k = int(policy.get("top_k", 3))
     active_threshold = float(policy.get("active_threshold", 0.2))
     active_nodes = [node for node, score in ranked[:top_k] if score >= active_threshold]
+    if primary not in active_nodes:
+        active_nodes.insert(0, primary)
     active_edges = [
         edge
         for edge in component_graph["edges"]

@@ -37,7 +37,12 @@ def _load_curve(result: dict[str, Any]) -> list[dict[str, Any]]:
         for line in f:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
     return rows
 
 

@@ -94,6 +94,17 @@ class GraphOrchestrator:
             if not isinstance(stage, str) or not stage:
                 raise GraphStateError("Iteration stages must be non-empty strings")
 
+    def _require_stage(self, stage_name: str) -> None:
+        if stage_name not in self.stages:
+            raise GraphStateError(f"Unknown orchestration stage: {stage_name}")
+
+    def _iteration_record(self, iteration: int) -> dict[str, Any]:
+        key = _iter_key(iteration)
+        try:
+            return self.state["iterations"][key]
+        except KeyError as exc:
+            raise GraphStateError(f"Iteration {key} has not been initialized") from exc
+
     def save(self) -> None:
         self.state["updated_at"] = _now()
         save_json(self.state, self.graph_path)
@@ -133,8 +144,7 @@ class GraphOrchestrator:
 
     @contextmanager
     def stage(self, iteration: int, stage_name: str, meta: dict[str, Any] | None = None) -> Iterator[None]:
-        if stage_name not in self.stages:
-            raise GraphStateError(f"Unknown orchestration stage: {stage_name}")
+        self._require_stage(stage_name)
         key = _iter_key(iteration)
         record = self.state.setdefault("iterations", {}).setdefault(
             key,
@@ -168,8 +178,9 @@ class GraphOrchestrator:
             self.save()
 
     def skip_stage(self, iteration: int, stage_name: str, reason: str) -> None:
+        self._require_stage(stage_name)
         self.ensure_iteration(iteration, self.run_root / _iter_key(iteration))
-        record = self.state["iterations"][_iter_key(iteration)]
+        record = self._iteration_record(iteration)
         stage = record.setdefault("stages", {}).setdefault(stage_name, {})
         stage.update({"status": "skipped", "reason": reason, "ended_at": _now()})
         record["updated_at"] = _now()
@@ -177,13 +188,13 @@ class GraphOrchestrator:
         self.save()
 
     def record_artifact(self, iteration: int, name: str, path: str | Path, kind: str = "file") -> None:
-        record = self.state["iterations"][_iter_key(iteration)]
+        record = self._iteration_record(iteration)
         record.setdefault("artifacts", {})[name] = {"path": str(path), "kind": kind, "recorded_at": _now()}
         record["updated_at"] = _now()
         self.save()
 
     def record_result(self, iteration: int, result: dict[str, Any]) -> None:
-        record = self.state["iterations"][_iter_key(iteration)]
+        record = self._iteration_record(iteration)
         target = result.get("metrics", {}).get("target", {}) if result.get("success") else {}
         record["harness"] = {
             "success": bool(result.get("success")),
@@ -206,7 +217,7 @@ class GraphOrchestrator:
         route: dict[str, Any],
         result: dict[str, Any],
     ) -> None:
-        record = self.state["iterations"][_iter_key(iteration)]
+        record = self._iteration_record(iteration)
         record["feedback"] = {
             "target_metric": feedback.get("target_metric"),
             "current_target": feedback.get("current_target"),
@@ -283,7 +294,7 @@ class GraphOrchestrator:
     def record_patch(self, iteration: int, patch_meta: dict[str, Any] | None) -> None:
         if not patch_meta:
             return
-        record = self.state["iterations"][_iter_key(iteration)]
+        record = self._iteration_record(iteration)
         record["patch"] = {
             "origin": patch_meta.get("origin"),
             "component": patch_meta.get("component"),
@@ -298,7 +309,7 @@ class GraphOrchestrator:
         self.save()
 
     def finish_iteration(self, iteration: int) -> None:
-        record = self.state["iterations"][_iter_key(iteration)]
+        record = self._iteration_record(iteration)
         if record.get("status") != "failed":
             record["status"] = "completed"
         record["updated_at"] = _now()
@@ -328,4 +339,3 @@ class GraphOrchestrator:
                 }
             )
         return rows
-

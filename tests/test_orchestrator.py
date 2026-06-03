@@ -40,3 +40,11 @@ def test_orchestrator_marks_failed_stage(tmp_path):
     assert record["stages"]["evaluate"]["status"] == "failed"
     assert "RuntimeError: boom" in record["stages"]["evaluate"]["error"]
 
+
+def test_orchestrator_rejects_unknown_stage(tmp_path):
+    orch = GraphOrchestrator.open(tmp_path)
+    orch.ensure_iteration(0, tmp_path / "iter_000")
+    with pytest.raises(Exception) as exc_info:
+        with orch.stage(0, "unknown"):
+            pass
+    assert "Unknown orchestration stage" in str(exc_info.value)

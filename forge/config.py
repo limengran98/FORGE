@@ -33,7 +33,6 @@ DEFAULT_EXPERIMENT_CONFIG: dict[str, Any] = {
         "num_workers": 0,
     },
     "model": {
-        "enc_in": 5,
         "hidden_dim": 256,
         "layer": 2,
         "dropout": 0.1,
@@ -46,40 +45,12 @@ DEFAULT_EXPERIMENT_CONFIG: dict[str, Any] = {
 }
 
 
-def _simple_yaml_load(path: Path) -> dict[str, Any]:
-    data: dict[str, Any] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        value = value.strip()
-        if value.startswith(("'", '"')) and value.endswith(("'", '"')):
-            value = value[1:-1]
-        elif value.lower() in {"true", "false"}:
-            value = value.lower() == "true"
-        elif value.lower() in {"null", "none"}:
-            value = None
-        else:
-            try:
-                value = int(value)
-            except ValueError:
-                try:
-                    value = float(value)
-                except ValueError:
-                    pass
-        data[key.strip()] = value
-    return data
-
-
 def load_yaml(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     if not path.exists():
         return {}
     if yaml is None:
-        return _simple_yaml_load(path)
+        raise RuntimeError("PyYAML is required to load FORGE configuration files")
     with path.open("r", encoding="utf-8") as f:
         loaded = yaml.safe_load(f) or {}
     if not isinstance(loaded, dict):
@@ -87,14 +58,31 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     return loaded
 
 
+def _json_default(obj: Any) -> Any:
+    if isinstance(obj, Path):
+        return str(obj)
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def save_json(data: Mapping[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-        tmp_name = f.name
-    Path(tmp_name).replace(path)
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=_json_default)
+            f.write("\n")
+            tmp_name = f.name
+        Path(tmp_name).replace(path)
+    except Exception:
+        if tmp_name:
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def load_json(path: str | Path) -> dict[str, Any]:

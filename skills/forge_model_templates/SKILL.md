@@ -8,9 +8,8 @@ Each template must:
 - Define `class ForgeModel(nn.Module)`.
 - Accept a `configs` object in `__init__`.
 - Accept only `x` in `forward`.
-- Return a tensor shaped `(batch, pred_len, 5)`.
+- Return a tensor shaped `(batch, pred_len, target_dim)` using the configured target count.
 - Avoid file I/O, subprocesses, network calls, and harness changes.
 
 Routing from model component to template is configured in
 `configs/harness/heuristic_patches.yaml`.
-
