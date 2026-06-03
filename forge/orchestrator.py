@@ -10,6 +10,7 @@ from typing import Any, Iterator
 from .config import load_json, save_json
 from .graph import initial_task_graph
 from .harness_spec import get_component_graph, get_iteration_stages, load_orchestration_spec
+from .trust import ensure_trust_relations, update_relations_from_outcome
 
 
 def _now() -> str:
@@ -59,6 +60,7 @@ class GraphOrchestrator:
         state.setdefault("created_at", _now())
         state["updated_at"] = _now()
         self._ensure_component_graph(state)
+        ensure_trust_relations(state)
         save_json(state, self.graph_path)
         return state
 
@@ -247,6 +249,8 @@ class GraphOrchestrator:
             "primary_component": route.get("primary_component"),
             "active_components": route.get("active_components") or [],
             "routing_policy": route.get("routing_policy"),
+            "trust_policy": route.get("trust_policy"),
+            "propagations": route.get("propagations") or [],
         }
         self._update_component_evidence(iteration, route, result, feedback)
         self.event(
@@ -319,12 +323,65 @@ class GraphOrchestrator:
             "summary": patch_meta.get("summary"),
             "output_model_path": patch_meta.get("output_model_path"),
             "diff_path": patch_meta.get("diff_path"),
+            "parent_model_path": patch_meta.get("parent_model_path"),
+            "routed_component": patch_meta.get("routed_component"),
+            "route_propagations": patch_meta.get("route_propagations") or [],
+            "trust_before": patch_meta.get("trust_before") or {},
+            "edit_action": patch_meta.get("edit_action"),
         }
         for key in ("output_model_path", "diff_path"):
             if patch_meta.get(key):
                 self.record_artifact(iteration, key, patch_meta[key])
         self.event("patch_recorded", {"iteration": iteration, "origin": patch_meta.get("origin")})
         self.save()
+
+    def update_trust_from_outcome(
+        self,
+        patch_iteration: int,
+        outcome_iteration: int,
+        previous_result: dict[str, Any],
+        next_result: dict[str, Any],
+        previous_feedback: dict[str, Any],
+        next_feedback: dict[str, Any],
+        target_metric: str,
+    ) -> list[dict[str, Any]]:
+        patch_record = self._iteration_record(patch_iteration).get("patch", {})
+        if not patch_record:
+            return []
+        existing = self._iteration_record(outcome_iteration).get("trust_updates", [])
+        if existing:
+            return list(existing)
+        updates = update_relations_from_outcome(
+            self.state,
+            patch_record,
+            previous_result,
+            next_result,
+            previous_feedback,
+            next_feedback,
+            target_metric,
+        )
+        outcome_record = self._iteration_record(outcome_iteration)
+        outcome_record["trust_updates"] = updates
+        outcome_record["updated_at"] = _now()
+        self.event(
+            "trust_updated",
+            {
+                "patch_iteration": patch_iteration,
+                "outcome_iteration": outcome_iteration,
+                "updates": [
+                    {
+                        "diagnostic": item.get("diagnostic"),
+                        "component": item.get("component"),
+                        "trust_before": item.get("trust_before"),
+                        "trust_after": item.get("trust_after"),
+                        "direction": item.get("direction"),
+                    }
+                    for item in updates
+                ],
+            },
+        )
+        self.save()
+        return updates
 
     def finish_iteration(self, iteration: int) -> None:
         record = self._iteration_record(iteration)

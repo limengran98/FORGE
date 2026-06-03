@@ -9,10 +9,11 @@ It fixes the Ms-AeDNet PEMFC harness and evolves only the model code. Each itera
 1. Loads the PEMFC data with the Ms-AeDNet chronological 6:2:2 protocol.
 2. Trains and evaluates a saved initial GRU model.
 3. Encodes metrics, errors, logs, and train/validation curves into a feedback vector.
-4. Routes noisy feedback to a model component on a component graph.
-5. Requests an LLM patch, or uses a deterministic heuristic fallback.
-6. Validates the patched `ForgeModel` interface.
-7. Saves metrics, feedback, route, code version, diff, task graph, and report.
+4. Converts executable artifacts into PEMFC diagnostic feedback nodes.
+5. Routes diagnostics to model components through trust-scored graph relations.
+6. Requests an LLM patch, or uses a deterministic heuristic fallback.
+7. Updates feedback-to-component trust from the next executable outcome.
+8. Saves metrics, feedback, route, trust updates, code version, diff, task graph, and report.
 
 ## Quick Start
 
@@ -43,7 +44,7 @@ python -m forge.cli run --device cpu
 Use the configured LLM:
 
 ```bash
-python -m forge.cli run --rounds 2 --epochs 200 --llm-mode required
+python -m forge.cli run --rounds 2 --epochs 200 --llm-mode required --routing-mode trust --parent-policy best
 ```
 
 The LLM config is at `configs/forge_llm.yaml`.
@@ -55,13 +56,13 @@ improving that same run, continue from the last completed iteration instead of
 starting over:
 
 ```bash
-python -m forge.cli continue --run-dir runs/<run_name> --additional-rounds 1 --epochs 200 --llm-mode required
+python -m forge.cli continue --run-dir runs/<run_name> --additional-rounds 1 --epochs 200 --llm-mode required --routing-mode trust --parent-policy best
 ```
 
 You can also target an absolute iteration index:
 
 ```bash
-python -m forge.cli continue --run-dir runs/<run_name> --to-round 3 --epochs 200 --llm-mode required
+python -m forge.cli continue --run-dir runs/<run_name> --to-round 3 --epochs 200 --llm-mode required --routing-mode trust --parent-policy best
 ```
 
 `--additional-rounds 1` means "add one more patch/evaluation after the current
@@ -69,6 +70,40 @@ last iteration." `--to-round 3` means "finish at `iter_003`." The command reuses
 the existing `run_config.json`, model code, feedback vectors, routing records,
 task graph, and patch artifacts. It only generates the missing next patch and
 then evaluates the next model.
+
+`--parent-policy best` uses degraded iterations to update trust, but starts the
+next edit from the current best model source. `--parent-policy last` gives a
+strict sequential chain.
+
+## Trust Routing And Ablations
+
+FORGE supports three routing modes:
+
+- `trust`: diagnostic feedback propagates through learned feedback-component relations, and those relations are updated by executable outcomes.
+- `prior`: diagnostic feedback uses fixed PEMFC priors without outcome-based trust updates.
+- `rule`: legacy rule routing only, without diagnostic trust propagation.
+
+For a small two-dataset, ten-iteration pilot:
+
+```bash
+python -m forge.cli sweep \
+  --datasets FC1 FC2 \
+  --seq-lens 24 \
+  --pred-lens 12 \
+  --rounds 10 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --run-name pilot_trust_FC1_FC2_L24_P12_R10
+```
+
+Run an ablation control by changing only the routing mode:
+
+```bash
+python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 --pred-lens 12 --rounds 10 --epochs 200 --llm-mode required --routing-mode rule --parent-policy best --run-name ablate_rule_FC1_FC2_L24_P12_R10
+python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 --pred-lens 12 --rounds 10 --epochs 200 --llm-mode required --routing-mode prior --parent-policy best --run-name ablate_prior_FC1_FC2_L24_P12_R10
+```
 
 ## Benchmark Grid
 
@@ -104,6 +139,7 @@ Most FORGE protocol constants live outside Python:
 - `configs/harness/feedback_schema.yaml`: feedback vector schema
 - `configs/harness/routing_graph.yaml`: component graph
 - `configs/harness/routing_policy.yaml`: routing thresholds, weights, and reason text
+- `configs/harness/trust_policy.yaml`: diagnostic-component priors and executable outcome trust updates
 - `configs/harness/heuristic_patches.yaml`: component-to-template fallback mapping
 - `skills/forge_model_templates/`: complete fallback model templates
 - `prompts/model_patch.yaml`: LLM patch prompt
@@ -116,9 +152,9 @@ Runs are written under `runs/<run_name>/`:
 - `iter_*/metrics.json`: normalized and inverse-voltage metrics
 - `iter_*/train_curve.jsonl`: epoch train/validation losses
 - `iter_*/feedback_vector.json`: noisy feedback vector and schema
-- `iter_*/routing.json`: graph routing result
+- `iter_*/routing.json`: graph routing result with diagnostic propagation evidence
 - `iter_*/patch.diff`: source diff for the next iteration
-- `task_graph.json`: evolving component graph state
+- `task_graph.json`: evolving component graph state and feedback-component trust relations
 - `graph_events.jsonl`: append-only orchestration event log
 - `summary.json`: run-level summary
 

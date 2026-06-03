@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from .harness_spec import get_component_graph
+from .trust import ensure_trust_relations
 
 
 def _now() -> str:
@@ -24,10 +25,12 @@ def initial_task_graph() -> dict[str, Any]:
             "created_at": _now(),
             "updated_at": _now(),
         }
-    return {
+    state = {
         "version": 1,
         "tasks": tasks,
         "edges": component_graph["edges"],
         "iteration_map": {},
         "created_at": _now(),
     }
+    ensure_trust_relations(state)
+    return state

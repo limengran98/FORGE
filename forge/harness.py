@@ -311,6 +311,7 @@ def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig)
         y_true_inv = _inverse_scale(y_true, pemfc.scaler_y, pemfc.enc_in)
         np.savez_compressed(
             prediction_path,
+            x_test=pemfc.X_test,
             y_pred=y_pred,
             y_true=y_true,
             y_pred_inverse=y_pred_inv,

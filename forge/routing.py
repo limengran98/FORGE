@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from .harness_spec import get_component_graph, get_routing_policy
+from .trust import (
+    candidate_components_for_diagnostic,
+    diagnostic_message,
+    ensure_trust_relations,
+    relation_id,
+    relation_trust,
+)
 
 
 def _policy_value(policy: dict[str, Any], group: str, key: str, default: float) -> float:
@@ -16,19 +23,57 @@ def _policy_text(policy: dict[str, Any], key: str) -> str:
     return str(policy.get("messages", {}).get(key, key))
 
 
-def route_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
+def route_feedback(
+    feedback: dict[str, Any],
+    graph_state: dict[str, Any] | None = None,
+    mode: str = "trust",
+) -> dict[str, Any]:
     component_graph = get_component_graph()
     policy = get_routing_policy()
+    mode = str(mode or "trust")
+    if mode not in {"rule", "prior", "trust"}:
+        raise ValueError("routing mode must be one of: rule, prior, trust")
+    if graph_state is not None and mode == "trust":
+        ensure_trust_relations(graph_state)
     f = feedback.get("features", {})
     initial_score = float(policy.get("initial_score", 0.05))
     scores = {node: initial_score for node in component_graph["nodes"]}
     reasons: dict[str, list[str]] = {node: [] for node in component_graph["nodes"]}
+    propagations: list[dict[str, Any]] = []
 
     def add(node: str, rule_key: str, amount: float | None = None) -> None:
         if amount is None:
             amount = _policy_value(policy, "rule_weights", rule_key, 0.0)
         scores[node] = scores.get(node, 0.0) + amount
         reasons.setdefault(node, []).append(_policy_text(policy, rule_key))
+
+    def propagate(diagnostic: dict[str, Any]) -> None:
+        name = str(diagnostic.get("name") or "")
+        severity = float(diagnostic.get("severity") or 0.0)
+        confidence = float(diagnostic.get("confidence") or 0.0)
+        if not name or severity <= 0.0 or confidence <= 0.0:
+            return
+        for component, prior in candidate_components_for_diagnostic(name).items():
+            trust = relation_trust(graph_state or {}, name, component) if graph_state is not None and mode == "trust" else float(prior)
+            contribution = severity * confidence * trust
+            if contribution <= 0:
+                continue
+            scores[component] = scores.get(component, 0.0) + contribution
+            message = diagnostic_message(name)
+            reasons.setdefault(component, []).append(message)
+            propagations.append(
+                {
+                    "relation_id": relation_id(name, component),
+                    "diagnostic": name,
+                    "component": component,
+                    "severity": round(severity, 6),
+                    "confidence": round(confidence, 6),
+                    "trust": round(trust, 6),
+                    "contribution": round(contribution, 6),
+                    "message": message,
+                    "evidence": diagnostic.get("evidence", {}),
+                }
+            )
 
     if f.get("has_exception", 0.0) > 0:
         if f.get("syntax_error", 0.0) > 0 or f.get("import_error", 0.0) > 0:
@@ -72,6 +117,11 @@ def route_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
         add("normalization", "mape_normalization")
         add("prediction_head", "mape_prediction_head")
 
+    if mode in {"prior", "trust"}:
+        for diagnostic in feedback.get("diagnostics", []):
+            if isinstance(diagnostic, dict):
+                propagate(diagnostic)
+
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     primary = ranked[0][0]
     top_k = int(policy.get("top_k", 3))
@@ -85,11 +135,17 @@ def route_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
         if edge["from"] in active_nodes or edge["to"] in active_nodes
     ]
 
+    trust_policy = {"rule": "rule_only", "prior": "trust_prior_only", "trust": "trust_graph_v1"}[mode]
+    if mode == "trust" and graph_state is None:
+        trust_policy = "trust_prior_only"
+
     return {
         "primary_component": primary,
         "active_components": active_nodes,
         "scores": {node: round(score, 4) for node, score in ranked},
         "reasons": {node: vals for node, vals in reasons.items() if vals},
+        "propagations": sorted(propagations, key=lambda item: item["contribution"], reverse=True),
+        "trust_policy": trust_policy,
         "component_graph": component_graph,
         "active_subgraph": {
             "nodes": active_nodes,

@@ -98,7 +98,12 @@ def _best_result(history: list[dict[str, Any]], target_metric: str) -> dict[str,
     )
 
 
-def _history_row(iteration: int, result: dict[str, Any], route: dict[str, Any]) -> dict[str, Any]:
+def _history_row(
+    iteration: int,
+    result: dict[str, Any],
+    route: dict[str, Any],
+    feedback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     target = result.get("metrics", {}).get("target", {}) if result.get("success") else {}
     return {
         "iteration": iteration,
@@ -108,7 +113,87 @@ def _history_row(iteration: int, result: dict[str, Any], route: dict[str, Any]) 
         "active_components": route.get("active_components"),
         "run_dir": result.get("run_dir"),
         "result": result,
+        "feedback": feedback,
+        "route": route,
     }
+
+
+def _history_feedback(history: list[dict[str, Any]], iteration: int) -> dict[str, Any] | None:
+    for row in reversed(history):
+        if row.get("iteration") == iteration:
+            feedback = row.get("feedback")
+            if isinstance(feedback, dict):
+                return feedback
+    return None
+
+
+def _history_route(history: list[dict[str, Any]], iteration: int) -> dict[str, Any] | None:
+    for row in reversed(history):
+        if row.get("iteration") == iteration:
+            route = row.get("route")
+            if isinstance(route, dict):
+                return route
+    return None
+
+
+def _attach_saved_feedback_and_routes(orchestrator: GraphOrchestrator, history: list[dict[str, Any]]) -> None:
+    for row in history:
+        iteration = int(row["iteration"])
+        try:
+            row["feedback"] = _load_iteration_json(orchestrator, iteration, "feedback_vector")
+        except Exception:
+            pass
+        try:
+            row["route"] = _load_iteration_json(orchestrator, iteration, "routing")
+        except Exception:
+            pass
+
+
+def _select_parent_model_path(
+    history: list[dict[str, Any]],
+    target_metric: str,
+    fallback: Path,
+    parent_policy: str,
+    run_root: Path,
+) -> Path:
+    if parent_policy != "best":
+        return fallback
+    best = _best_result(history, target_metric)
+    if not best:
+        return fallback
+    path = best.get("model_path") or best.get("paths", {}).get("model") or Path(best.get("run_dir", "")) / "model.py"
+    try:
+        resolved = _resolve_stored_path(path, run_root)
+    except Exception:
+        return fallback
+    return resolved if resolved.exists() else fallback
+
+
+def _maybe_update_trust_for_iteration(
+    orchestrator: GraphOrchestrator,
+    history: list[dict[str, Any]],
+    outcome_iteration: int,
+    target_metric: str,
+) -> None:
+    if outcome_iteration <= 0:
+        return
+    previous_row = next((row for row in history if row.get("iteration") == outcome_iteration - 1), None)
+    outcome_row = next((row for row in history if row.get("iteration") == outcome_iteration), None)
+    if not previous_row or not outcome_row:
+        return
+    previous_feedback = previous_row.get("feedback")
+    outcome_feedback = outcome_row.get("feedback")
+    if not isinstance(previous_feedback, dict) or not isinstance(outcome_feedback, dict):
+        return
+    orchestrator.update_trust_from_outcome(
+        outcome_iteration - 1,
+        outcome_iteration,
+        previous_row["result"],
+        outcome_row["result"],
+        previous_feedback,
+        outcome_feedback,
+        target_metric,
+    )
 
 
 def _validation_config(hcfg: HarnessConfig) -> SimpleNamespace:
@@ -194,6 +279,15 @@ def _generate_patch_for_next_iteration(
             )
         else:
             raise
+    patch_meta["routed_component"] = route.get("primary_component")
+    patch_meta["route_propagations"] = route.get("propagations") or []
+    patch_meta["trust_before"] = {
+        item.get("relation_id"): item.get("trust")
+        for item in route.get("propagations", [])
+        if item.get("relation_id")
+    }
+    patch_meta["parent_model_path"] = str(current_model_path)
+    save_json(patch_meta, next_dir / "patch_meta.json")
     orchestrator.record_patch(current_iteration, patch_meta)
     return next_model_path, patch_meta
 
@@ -270,12 +364,21 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     target_metric = args.target_metric or exp_cfg["evolution"]["target_metric"]
     rounds = int(args.rounds if args.rounds is not None else exp_cfg["evolution"]["rounds"])
     llm_mode = args.llm_mode or exp_cfg["evolution"]["llm_mode"]
+    parent_policy = args.parent_policy or "best"
+    routing_mode = args.routing_mode or "trust"
     hcfg = _harness_config_from_args(args, exp_cfg)
 
     run_name = args.run_name or f"forge_{_timestamp()}"
     run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (RUNS_DIR / run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
-    save_json({"experiment_config": exp_cfg, "harness_config": hcfg.__dict__}, run_root / "run_config.json")
+    save_json(
+        {
+            "experiment_config": exp_cfg,
+            "harness_config": hcfg.__dict__,
+            "runtime": {"parent_policy": parent_policy, "routing_mode": routing_mode},
+        },
+        run_root / "run_config.json",
+    )
 
     orchestrator = GraphOrchestrator.open(run_root)
     history: list[dict[str, Any]] = []
@@ -290,6 +393,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[FORGE] Dataset: {hcfg.data_name} | seq_len: {hcfg.seq_len} | pred_len: {hcfg.pred_len}")
     print(f"[FORGE] Device: {_device_label(hcfg)}")
     print(f"[FORGE] LLM mode: {llm_mode}")
+    print(f"[FORGE] Parent policy: {parent_policy}")
+    print(f"[FORGE] Routing mode: {routing_mode}")
     print(f"[FORGE] Rounds: {rounds}")
     if not getattr(args, "_sweep_child", False):
         _warn_if_heuristic_only(llm_mode, rounds)
@@ -319,24 +424,45 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             save_json(feedback, feedback_path)
             orchestrator.record_artifact(iteration, "feedback_vector", feedback_path)
 
+        if routing_mode == "trust" and iteration > 0 and previous_result is not None:
+            previous_feedback = _history_feedback(history, iteration - 1)
+            if previous_feedback is not None:
+                orchestrator.update_trust_from_outcome(
+                    iteration - 1,
+                    iteration,
+                    previous_result,
+                    result,
+                    previous_feedback,
+                    feedback,
+                    target_metric,
+                )
+
         with orchestrator.stage(iteration, "route"):
-            route = route_feedback(feedback)
+            route_state = orchestrator.state if routing_mode == "trust" else None
+            route = route_feedback(feedback, route_state, mode=routing_mode)
             route_path = iter_dir / "routing.json"
             save_json(route, route_path)
             orchestrator.record_artifact(iteration, "routing", route_path)
             orchestrator.record_feedback_and_route(iteration, feedback, route, result)
 
         patch_meta = None
-        history.append(_history_row(iteration, result, route))
+        history.append(_history_row(iteration, result, route, feedback))
         if iteration < rounds:
             next_dir = run_root / f"iter_{iteration + 1:03d}"
             with orchestrator.stage(iteration, "patch", {"next_iteration": iteration + 1}):
                 next_dir.mkdir(parents=True, exist_ok=True)
+                parent_model_path = _select_parent_model_path(
+                    history,
+                    target_metric,
+                    current_model_path,
+                    parent_policy,
+                    run_root,
+                )
                 current_model_path, patch_meta = _generate_patch_for_next_iteration(
                     orchestrator,
                     iteration,
                     iteration + 1,
-                    current_model_path,
+                    parent_model_path,
                     next_dir,
                     hcfg,
                     llm_mode,
@@ -349,7 +475,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         with orchestrator.stage(iteration, "report"):
             report_path = iter_dir / "report.md"
-            write_iteration_report(report_path, iteration, result, feedback, route, patch_meta)
+            trust_updates = orchestrator.state["iterations"][f"iter_{iteration:03d}"].get("trust_updates", [])
+            write_iteration_report(report_path, iteration, result, feedback, route, patch_meta, trust_updates)
             orchestrator.record_artifact(iteration, "report", report_path)
         orchestrator.finish_iteration(iteration)
 
@@ -397,8 +524,11 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
     ensure_ms_aednet_data()
 
     run_root, _exp_cfg, hcfg, target_metric, llm_mode = _load_continue_run(args)
+    parent_policy = args.parent_policy or "best"
+    routing_mode = args.routing_mode or "trust"
     orchestrator = GraphOrchestrator.open(run_root)
     history = orchestrator.history_rows(target_metric)
+    _attach_saved_feedback_and_routes(orchestrator, history)
     if not history:
         raise RuntimeError(f"No completed iterations found in {run_root}")
     last_iteration = history[-1]["iteration"]
@@ -408,6 +538,8 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[FORGE] Dataset: {hcfg.data_name} | seq_len: {hcfg.seq_len} | pred_len: {hcfg.pred_len}")
     print(f"[FORGE] Device: {_device_label(hcfg)}")
     print(f"[FORGE] LLM mode: {llm_mode}")
+    print(f"[FORGE] Parent policy: {parent_policy}")
+    print(f"[FORGE] Routing mode: {routing_mode}")
     print(f"[FORGE] Continuing from iter_{last_iteration:03d} to iter_{to_round:03d}")
     _warn_if_heuristic_only(llm_mode, to_round - last_iteration, scope="continue")
     orchestrator.event(
@@ -429,6 +561,12 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         result = _load_iteration_json(orchestrator, current_iteration, "result")
         feedback = _load_iteration_json(orchestrator, current_iteration, "feedback_vector")
         route = _load_iteration_json(orchestrator, current_iteration, "routing")
+        current_row = next((row for row in history if row.get("iteration") == current_iteration), None)
+        if current_row is not None:
+            current_row["feedback"] = feedback
+            current_row["route"] = route
+        if routing_mode == "trust":
+            _maybe_update_trust_for_iteration(orchestrator, history, current_iteration, target_metric)
 
         next_iteration = current_iteration + 1
         next_dir = run_root / f"iter_{next_iteration:03d}"
@@ -441,12 +579,28 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
             next_model_path = existing_next_model_path
             print(f"[FORGE] Reusing existing patch for iter_{current_iteration:03d} -> iter_{next_iteration:03d}")
         else:
+            with orchestrator.stage(current_iteration, "route", {"resume": True, "trust_refresh": True}):
+                route_state = orchestrator.state if routing_mode == "trust" else None
+                route = route_feedback(feedback, route_state, mode=routing_mode)
+                route_path = run_root / current_key / "routing.json"
+                save_json(route, route_path)
+                orchestrator.record_artifact(current_iteration, "routing", route_path)
+                orchestrator.record_feedback_and_route(current_iteration, feedback, route, result)
+                if current_row is not None:
+                    current_row["route"] = route
             with orchestrator.stage(current_iteration, "patch", {"next_iteration": next_iteration, "resume": True}):
+                parent_model_path = _select_parent_model_path(
+                    history,
+                    target_metric,
+                    current_model_path,
+                    parent_policy,
+                    run_root,
+                )
                 next_model_path, patch_meta = _generate_patch_for_next_iteration(
                     orchestrator,
                     current_iteration,
                     next_iteration,
-                    current_model_path,
+                    parent_model_path,
                     next_dir,
                     hcfg,
                     llm_mode,
@@ -456,7 +610,8 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
                 )
             with orchestrator.stage(current_iteration, "report", {"resume": True, "patch_refresh": True}):
                 report_path = run_root / current_key / "report.md"
-                write_iteration_report(report_path, current_iteration, result, feedback, route, patch_meta)
+                trust_updates = current_record.get("trust_updates", [])
+                write_iteration_report(report_path, current_iteration, result, feedback, route, patch_meta, trust_updates)
                 orchestrator.record_artifact(current_iteration, "report", report_path)
             orchestrator.finish_iteration(current_iteration)
 
@@ -481,20 +636,33 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
             save_json(next_feedback, feedback_path)
             orchestrator.record_artifact(next_iteration, "feedback_vector", feedback_path)
 
+        if routing_mode == "trust":
+            orchestrator.update_trust_from_outcome(
+                current_iteration,
+                next_iteration,
+                result,
+                next_result,
+                feedback,
+                next_feedback,
+                target_metric,
+            )
+
         with orchestrator.stage(next_iteration, "route", {"resume": True}):
-            next_route = route_feedback(next_feedback)
+            route_state = orchestrator.state if routing_mode == "trust" else None
+            next_route = route_feedback(next_feedback, route_state, mode=routing_mode)
             route_path = next_dir / "routing.json"
             save_json(next_route, route_path)
             orchestrator.record_artifact(next_iteration, "routing", route_path)
             orchestrator.record_feedback_and_route(next_iteration, next_feedback, next_route, next_result)
 
-        history.append(_history_row(next_iteration, next_result, next_route))
+        history.append(_history_row(next_iteration, next_result, next_route, next_feedback))
         if next_iteration == to_round:
             orchestrator.skip_stage(next_iteration, "patch", "final_iteration")
 
         with orchestrator.stage(next_iteration, "report", {"resume": True}):
             report_path = next_dir / "report.md"
-            write_iteration_report(report_path, next_iteration, next_result, next_feedback, next_route, None)
+            trust_updates = orchestrator.state["iterations"][f"iter_{next_iteration:03d}"].get("trust_updates", [])
+            write_iteration_report(report_path, next_iteration, next_result, next_feedback, next_route, None, trust_updates)
             orchestrator.record_artifact(next_iteration, "report", report_path)
         orchestrator.finish_iteration(next_iteration)
         current_iteration = next_iteration
@@ -581,6 +749,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--run-name", default=None)
     run_p.add_argument("--rounds", type=int, default=None)
     run_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
+    run_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
+    run_p.add_argument("--routing-mode", choices=["trust", "prior", "rule"], default="trust")
     run_p.add_argument("--target-metric", default=None)
     run_p.add_argument("--data", choices=sorted(get_dataset_files()), default=None)
     run_p.add_argument("--data-path", default=None)
@@ -611,6 +781,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of new evolution rounds to add after the last completed iteration",
     )
     continue_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
+    continue_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
+    continue_p.add_argument("--routing-mode", choices=["trust", "prior", "rule"], default="trust")
     continue_p.add_argument("--target-metric", default=None)
     continue_p.add_argument("--epochs", type=int, default=None)
     continue_p.add_argument("--batch-size", type=int, default=None)
@@ -627,6 +799,8 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument("--run-name", default=None)
     sweep_p.add_argument("--rounds", type=int, default=None)
     sweep_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
+    sweep_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
+    sweep_p.add_argument("--routing-mode", choices=["trust", "prior", "rule"], default="trust")
     sweep_p.add_argument("--target-metric", default=None)
     sweep_p.add_argument("--datasets", nargs="+", choices=sorted(get_dataset_files()), default=None)
     sweep_p.add_argument("--seq-lens", nargs="+", type=int, default=None)

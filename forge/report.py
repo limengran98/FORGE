@@ -11,6 +11,7 @@ def write_iteration_report(
     feedback: dict[str, Any],
     route: dict[str, Any],
     patch_meta: dict[str, Any] | None = None,
+    trust_updates: list[dict[str, Any]] | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +54,34 @@ def write_iteration_report(
             for reason in reasons:
                 lines.append(f"- {reason}")
             lines.append("")
+    diagnostics = feedback.get("diagnostics") or []
+    if diagnostics:
+        lines.extend(["## Diagnostic Feedback", ""])
+        for item in sorted(diagnostics, key=lambda row: row.get("severity", 0.0) * row.get("confidence", 0.0), reverse=True):
+            lines.append(
+                f"- `{item.get('name')}` severity={item.get('severity')} "
+                f"confidence={item.get('confidence')}"
+            )
+        lines.append("")
+    propagations = route.get("propagations") or []
+    if propagations:
+        lines.extend(["## Trust-Guided Propagation", ""])
+        for item in propagations[:8]:
+            lines.append(
+                f"- `{item.get('diagnostic')}` -> `{item.get('component')}` "
+                f"trust={item.get('trust')} contribution={item.get('contribution')}"
+            )
+        lines.append("")
+    if trust_updates:
+        lines.extend(["## Trust Updates From Executable Outcome", ""])
+        for item in trust_updates:
+            reward = item.get("reward", {})
+            lines.append(
+                f"- `{item.get('diagnostic')}` -> `{item.get('component')}` "
+                f"{item.get('direction')}: {item.get('trust_before')} -> {item.get('trust_after')} "
+                f"reward={reward.get('reward')}"
+            )
+        lines.append("")
     if patch_meta:
         lines.extend(
             [
@@ -60,10 +89,11 @@ def write_iteration_report(
                 "",
                 f"- Origin: `{patch_meta.get('origin')}`",
                 f"- Component: `{patch_meta.get('component')}`",
+                f"- Edit action: `{patch_meta.get('edit_action')}`",
                 f"- Summary: {patch_meta.get('summary')}",
+                f"- Parent model: `{patch_meta.get('parent_model_path')}`",
                 f"- Diff: `{patch_meta.get('diff_path')}`",
                 "",
             ]
         )
     path.write_text("\n".join(lines), encoding="utf-8")
-

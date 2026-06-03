@@ -44,6 +44,10 @@ def test_continue_parser_accepts_resume_target():
             "10",
             "--llm-mode",
             "required",
+            "--parent-policy",
+            "best",
+            "--routing-mode",
+            "trust",
             "--device",
             "cuda",
             "--cuda-id",
@@ -54,6 +58,8 @@ def test_continue_parser_accepts_resume_target():
     assert args.to_round == 3
     assert args.epochs == 10
     assert args.llm_mode == "required"
+    assert args.parent_policy == "best"
+    assert args.routing_mode == "trust"
     assert args.device == "cuda"
     assert args.cuda_id == 1
 

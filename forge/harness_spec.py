@@ -37,6 +37,11 @@ def load_routing_policy_spec() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
+def load_trust_policy_spec() -> dict[str, Any]:
+    return _load_named_yaml("trust_policy.yaml")
+
+
+@lru_cache(maxsize=1)
 def load_heuristic_patch_spec() -> dict[str, Any]:
     return _load_named_yaml("heuristic_patches.yaml")
 
@@ -141,6 +146,10 @@ def get_routing_policy() -> dict[str, Any]:
     return load_routing_policy_spec()
 
 
+def get_trust_policy() -> dict[str, Any]:
+    return load_trust_policy_spec()
+
+
 def resolve_project_path(path: str | Path) -> Path:
     path = Path(path)
     if path.is_absolute():
@@ -206,6 +215,18 @@ def validate_harness_specs() -> None:
         raise ValueError("routing_policy.yaml top_k must be positive")
     if float(policy.get("active_threshold", 0.0)) < 0:
         raise ValueError("routing_policy.yaml active_threshold must be non-negative")
+
+    trust_policy = get_trust_policy()
+    priors = trust_policy.get("diagnostic_component_priors", {})
+    if not priors:
+        raise ValueError("trust_policy.yaml must define diagnostic_component_priors")
+    known_components = set(get_component_graph()["nodes"])
+    for diagnostic, component_priors in priors.items():
+        if not isinstance(component_priors, dict) or not component_priors:
+            raise ValueError(f"trust prior for {diagnostic!r} must map to at least one component")
+        unknown = [component for component in component_priors if component not in known_components]
+        if unknown:
+            raise ValueError(f"trust prior for {diagnostic!r} references unknown components: {unknown}")
 
     get_component_graph()
     get_iteration_stages()

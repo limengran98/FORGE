@@ -1,0 +1,67 @@
+name: trust_graph_v1
+
+prior_strength: 3.0
+default_prior: 0.35
+exploration_bonus: 0.02
+min_active_contribution: 0.03
+
+reward:
+  target_weight: 0.7
+  diagnostic_weight: 0.3
+  overfit_penalty_weight: 0.15
+  positive_threshold: 0.002
+  negative_threshold: -0.002
+  update_scale: 2.0
+  max_update: 1.0
+
+diagnostic_component_priors:
+  harness_failure:
+    interface: 0.55
+  shape_contract_error:
+    prediction_head: 0.98
+    interface: 0.25
+  nan_instability:
+    normalization: 0.80
+    optimization: 0.70
+  train_val_gap:
+    regularization: 0.85
+    prediction_head: 0.55
+    optimization: 0.45
+  val_curve_instability:
+    optimization: 0.75
+    normalization: 0.55
+  long_horizon_error:
+    temporal_memory: 0.75
+    prediction_head: 0.60
+  residual_autocorrelation:
+    temporal_memory: 0.80
+    input_embedding: 0.45
+  residual_drift:
+    normalization: 0.65
+    temporal_memory: 0.55
+  dynamic_load_error:
+    factor_fusion: 0.80
+    input_embedding: 0.50
+  late_life_error:
+    temporal_memory: 0.65
+    normalization: 0.50
+  channel_imbalance:
+    prediction_head: 0.60
+    normalization: 0.55
+  target_degradation:
+    regularization: 0.70
+    optimization: 0.60
+
+diagnostic_messages:
+  harness_failure: Harness/runtime failure should first repair the fixed model contract.
+  shape_contract_error: Output shape or tensor contract points to prediction head/interface repair.
+  nan_instability: Non-finite behavior suggests scale or optimizer instability.
+  train_val_gap: Validation loss diverges from train loss, indicating overfitting.
+  val_curve_instability: Noisy validation dynamics suggest optimizer or normalization issues.
+  long_horizon_error: Late forecast horizons are worse than short horizons.
+  residual_autocorrelation: Residuals remain temporally correlated.
+  residual_drift: Residual mean drifts across the chronological test segment.
+  dynamic_load_error: Error increases under dynamic operating-factor changes.
+  late_life_error: Chronological test-tail error is worse than early test error.
+  channel_imbalance: Some PEMFC voltage channels are much harder than others.
+  target_degradation: Target metric worsened after the previous executable edit.

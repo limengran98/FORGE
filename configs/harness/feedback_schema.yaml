@@ -20,4 +20,15 @@ vector_schema:
   - degraded_vs_previous
   - improved_vs_best
   - cold_start
-
+  - diag_harness_failure
+  - diag_shape_contract_error
+  - diag_nan_instability
+  - diag_train_val_gap
+  - diag_val_curve_instability
+  - diag_long_horizon_error
+  - diag_residual_autocorrelation
+  - diag_residual_drift
+  - diag_dynamic_load_error
+  - diag_late_life_error
+  - diag_channel_imbalance
+  - diag_target_degradation

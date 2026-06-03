@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from .diagnostics import diagnose_result
 from .harness_spec import get_feedback_schema
 
 
@@ -91,6 +92,13 @@ def encode_feedback(
     if current_target is not None and best_target is not None:
         improved_best = max(0.0, (best_target - current_target) / (abs(best_target) + 1e-8))
 
+    diagnostics = diagnose_result(result, previous_result, best_result, target_metric=target_metric)
+    diagnostic_features = {
+        f"diag_{item['name']}": float(item.get("severity", 0.0)) * float(item.get("confidence", 0.0))
+        for item in diagnostics
+        if item.get("name")
+    }
+
     features = {
         "run_success": 1.0 if success else 0.0,
         "has_exception": 0.0 if success else 1.0,
@@ -114,6 +122,7 @@ def encode_feedback(
         "improved_vs_best": improved_best,
         "cold_start": 1.0 if previous_result is None else 0.0,
     }
+    features.update(diagnostic_features)
     schema = get_feedback_schema()
     vector = [float(features.get(name, 0.0)) for name in schema]
 
@@ -121,6 +130,7 @@ def encode_feedback(
         "schema": schema,
         "vector": vector,
         "features": features,
+        "diagnostics": diagnostics,
         "target_metric": target_metric,
         "current_target": current_target,
         "previous_target": previous_target,

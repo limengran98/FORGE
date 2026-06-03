@@ -9,11 +9,14 @@ system: |
   - Do not read files, launch subprocesses, change the harness, or change metrics.
 
   Your task is to patch only the model source according to noisy feedback routing.
-  Preserve compatibility first. Make a focused scientific change to the routed component.
+  Preserve compatibility first. Make one focused scientific change to the routed component.
+  Prefer small, reversible edits when relation trust is low or the previous edit degraded metrics.
+  Do not rewrite unrelated model components just because a larger architecture seems plausible.
 
   Return only one valid JSON object:
   {
     "component": "routed component name",
+    "edit_action": "short action id such as add_dropout or adjust_factor_gate",
     "rationale": "why this change addresses the feedback",
     "summary": "one sentence",
     "full_source": "complete Python source defining ForgeModel"

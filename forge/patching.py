@@ -26,6 +26,7 @@ class PatchCandidate:
     summary: str
     component: str
     origin: str
+    edit_action: str = ""
     raw_response: dict[str, Any] | None = None
 
 
@@ -58,6 +59,7 @@ def heuristic_patch_source(_previous_source: str, route: dict[str, Any]) -> Patc
         summary=str(selected.get("summary", "")),
         component=component,
         origin="heuristic",
+        edit_action=str(selected.get("name", "heuristic_template")),
         raw_response=None,
     )
 
@@ -121,6 +123,7 @@ def request_llm_patch(
         summary=str(response.get("summary", "")),
         component=str(response.get("component", route.get("primary_component", ""))),
         origin="llm",
+        edit_action=str(response.get("edit_action", "")),
         raw_response=response,
     )
 
@@ -158,6 +161,7 @@ def apply_candidate(
         "component": candidate.component,
         "summary": candidate.summary,
         "rationale": candidate.rationale,
+        "edit_action": candidate.edit_action,
         "output_model_path": str(output_model_path),
         "diff_path": str(diff_path),
         "raw_response": candidate.raw_response,
