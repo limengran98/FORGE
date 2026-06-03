@@ -1,0 +1,38 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.env
+.venv/
+venv/
+env/
+
+# Secrets and local credentials
+configs/forge_llm.yaml
+*.key
+*.pem
+
+# Baseline archives and extracted/produced data
+*.zip
+data/
+runs/
+
+# Experiment artifacts
+*.pt
+*.pth
+*.npz
+*.npy
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+.git.empty.*/

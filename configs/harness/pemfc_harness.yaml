@@ -1,0 +1,60 @@
+name: pemfc_ms_aednet
+description: Fixed PEMFC forecasting harness derived from Ms-AeDNet.
+default_dataset: FC2
+
+archive:
+  input_prefix: Ms-AeDNet-main/input
+
+datasets:
+  FC1:
+    filename: FC1_Without_Ripples_Excel.csv
+    description: PEMFC run without ripples.
+  FC2:
+    filename: FC2_With_Ripples_Excel.csv
+    description: PEMFC run with ripples.
+
+features:
+  voltage_inputs:
+    - U1 (V)
+    - U2 (V)
+    - U3 (V)
+    - U4 (V)
+    - U5 (V)
+  factor_inputs:
+    - Time (h)
+    - I (A)
+    - TinH2 (C)
+    - ToutH2 (C)
+    - TinAIR (C)
+    - ToutAIR (C)
+    - TinWAT (C)
+    - ToutWAT (C)
+    - PinAIR (mbara)
+    - PoutAIR (mbara)
+    - PinH2 (mbara)
+    - PoutH2 (mbara)
+    - DinH2 (l/mn)
+    - DoutH2 (l/mn)
+    - DinAIR (l/mn)
+    - DoutAIR (l/mn)
+    - DWAT (l/mn)
+    - HrAIRFC (%)
+  targets:
+    - U1 (V)
+    - U2 (V)
+    - U3 (V)
+    - U4 (V)
+    - U5 (V)
+
+split:
+  mode: chronological
+  train: 0.6
+  val: 0.2
+  test: 0.2
+
+model_interface:
+  class_name: ForgeModel
+  input_shape: [batch, seq_len, 23]
+  output_shape: [batch, pred_len, 5]
+  input_feature_dim: 23
+  target_dim: 5

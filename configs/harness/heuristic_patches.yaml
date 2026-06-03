@@ -1,0 +1,26 @@
+rules:
+  - name: context_fusion_gru
+    components:
+      - factor_fusion
+      - input_embedding
+      - temporal_memory
+      - backbone
+    template: skills/forge_model_templates/context_fusion_gru.py
+    summary: Adds operating-factor context encoding and gated fusion before the GRU.
+    rationale: Heuristic fallback selected from feedback routing when LLM is disabled or unavailable.
+  - name: stable_head_gru
+    components:
+      - prediction_head
+      - normalization
+      - optimization
+      - regularization
+    template: skills/forge_model_templates/stable_head_gru.py
+    summary: Adds layer normalization, dropout, and a conservative level/delta horizon head.
+    rationale: Heuristic fallback selected from feedback routing when LLM is disabled or unavailable.
+  - name: fallback_context_fusion_gru
+    components:
+      - default
+    template: skills/forge_model_templates/context_fusion_gru.py
+    summary: Falls back to a context-aware GRU that preserves the fixed harness interface.
+    rationale: Default heuristic fallback for unrouted components.
+

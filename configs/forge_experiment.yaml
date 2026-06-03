@@ -1,0 +1,27 @@
+data:
+  name: FC2
+  seq_len: 24
+  pred_len: 12
+  scaling: baseline
+  limit_rows:
+
+harness:
+  epochs: 200
+  batch_size: 128
+  lr: 0.001
+  patience: 5
+  seed: 2025
+  device: cuda
+  cuda_id: 0
+  num_workers: 0
+
+model:
+  enc_in: 5
+  hidden_dim: 256
+  layer: 2
+  dropout: 0.1
+
+evolution:
+  rounds: 1
+  target_metric: mae_inverse
+  llm_mode: auto

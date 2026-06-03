@@ -1,0 +1,27 @@
+version: 1
+description: Stable FORGE graph orchestration lifecycle.
+
+iteration_stages:
+  - prepare
+  - evaluate
+  - feedback
+  - route
+  - patch
+  - report
+
+stage_statuses:
+  - pending
+  - running
+  - succeeded
+  - failed
+  - skipped
+
+iteration_statuses:
+  - pending
+  - running
+  - completed
+  - failed
+
+event_log: graph_events.jsonl
+graph_state: task_graph.json
+

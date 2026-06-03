@@ -1,0 +1,56 @@
+name: rule_graph_v1
+initial_score: 0.05
+active_threshold: 0.2
+top_k: 3
+
+rule_weights:
+  syntax_interface: 1.0
+  shape_prediction_head: 0.9
+  shape_interface: 0.4
+  oom_temporal_memory: 0.6
+  oom_regularization: 0.4
+  nan_normalization: 0.8
+  nan_optimization: 0.5
+  runtime_interface: 0.5
+  cold_start_factor_fusion: 0.7
+  cold_start_temporal_memory: 0.2
+  degraded_optimization: 0.35
+  degraded_regularization: 0.25
+  overfit_prediction_head: 0.2
+  underfit_temporal_memory: 0.55
+  underfit_input_embedding: 0.25
+  volatile_optimization: 0.45
+  volatile_normalization: 0.25
+  mape_normalization: 0.25
+  mape_prediction_head: 0.2
+
+thresholds:
+  degraded_vs_previous: 0.02
+  overfit_score: 0.15
+  underfit_score: 0.35
+  underfit_val_slope: -0.002
+  val_volatility: 0.05
+  mape_inverse_log: 2.0
+
+messages:
+  syntax_interface: Model source failed before training; repair imports/class contract first.
+  shape_prediction_head: Runtime shape mismatch points to horizon/channel output contract.
+  shape_interface: Shape failures can also come from violating the harness interface.
+  oom_temporal_memory: Memory failure suggests the recurrent/attention state is too large.
+  oom_regularization: Reduce capacity or add cheaper regularized paths.
+  nan_normalization: Non-finite feedback often comes from unstable normalization or scaling.
+  nan_optimization: Loss explosion can require gradient/lr stabilization.
+  runtime_interface: Unhandled runtime failure should first preserve fixed harness compatibility.
+  cold_start_factor_fusion: The saved initial GRU uses voltage history only; PEMFC operating factors are available.
+  cold_start_temporal_memory: Cold-start evolution can improve temporal representation after baseline validation.
+  degraded_optimization: Metric degraded relative to previous iteration; prefer conservative repair.
+  degraded_regularization: Degradation after a patch can indicate over-specialization.
+  overfit_regularization: Validation loss is higher than train loss.
+  overfit_prediction_head: A high-capacity head can amplify overfitting across horizons.
+  underfit_temporal_memory: Loss remains high and flat; backbone memory may be underpowered.
+  underfit_input_embedding: Input representation may be too weak for the PEMFC signal.
+  volatile_optimization: Noisy validation curve suggests optimization instability.
+  volatile_normalization: Curve volatility can reflect unstable scale handling.
+  mape_normalization: Large percentage error can reflect local scale bias.
+  mape_prediction_head: Horizon calibration may need a stronger head.
+

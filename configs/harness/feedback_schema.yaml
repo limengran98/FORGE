@@ -1,0 +1,23 @@
+vector_schema:
+  - run_success
+  - has_exception
+  - syntax_error
+  - import_error
+  - shape_error
+  - oom_error
+  - nan_or_inf
+  - mae_inverse_log
+  - rmse_inverse_log
+  - mape_inverse_log
+  - train_final_loss
+  - val_final_loss
+  - generalization_gap
+  - overfit_score
+  - underfit_score
+  - val_slope
+  - val_volatility
+  - early_stopped
+  - degraded_vs_previous
+  - improved_vs_best
+  - cold_start
+

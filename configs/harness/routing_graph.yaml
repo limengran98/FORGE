@@ -1,0 +1,33 @@
+component_graph:
+  nodes:
+    - interface
+    - normalization
+    - input_embedding
+    - temporal_memory
+    - factor_fusion
+    - prediction_head
+    - regularization
+    - optimization
+  edges:
+    - from: interface
+      to: input_embedding
+      type: feeds
+    - from: input_embedding
+      to: temporal_memory
+      type: feeds
+    - from: factor_fusion
+      to: temporal_memory
+      type: conditions
+    - from: normalization
+      to: input_embedding
+      type: stabilizes
+    - from: temporal_memory
+      to: prediction_head
+      type: feeds
+    - from: regularization
+      to: temporal_memory
+      type: constrains
+    - from: optimization
+      to: regularization
+      type: coordinates
+
