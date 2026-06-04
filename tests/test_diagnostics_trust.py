@@ -2,7 +2,7 @@ import numpy as np
 
 from forge.diagnostics import diagnose_result
 from forge.graph import initial_task_graph
-from forge.memory import action_relation_id, update_action_memory_from_outcome
+from forge.memory import action_relation_id, ensure_action_memory, update_action_memory_from_outcome
 from forge.routing import route_feedback
 from forge.trust import relation_id, update_relations_from_outcome
 
@@ -45,6 +45,7 @@ def test_trust_routing_records_feedback_component_propagation():
     assert "temporal_memory" in route["active_components"]
     assert route["selected_edit"] is None
     assert route["edit_candidates"] == []
+    assert "action_memory" not in state
 
 
 def test_trust_action_routing_selects_relation_level_edit():
@@ -170,8 +171,9 @@ def test_validation_fallback_does_not_reward_noop_metrics():
 
 def test_action_memory_updates_feedback_component_edit_relation():
     state = initial_task_graph()
+    action_memory = ensure_action_memory(state)
     rid = action_relation_id("long_horizon_error", "temporal_memory", "add_temporal_smoothing")
-    before = state["action_memory"]["relations"][rid]["trust"]
+    before = action_memory[rid]["trust"]
     patch_record = {
         "component": "temporal_memory",
         "selected_edit": {
@@ -216,8 +218,9 @@ def test_action_memory_updates_feedback_component_edit_relation():
 
 def test_off_policy_mismatch_does_not_reward_selected_relation():
     state = initial_task_graph()
+    action_memory = ensure_action_memory(state)
     rid = action_relation_id("target_degradation", "regularization", "increase_regularization")
-    before = state["action_memory"]["relations"][rid]["trust"]
+    before = action_memory[rid]["trust"]
     patch_record = {
         "component": "temporal_memory",
         "edit_action": "add_temporal_smoothing",
@@ -269,10 +272,11 @@ def test_off_policy_mismatch_does_not_reward_selected_relation():
 
 def test_mismatch_updates_actual_relation_as_reduced_off_policy_evidence():
     state = initial_task_graph()
+    action_memory = ensure_action_memory(state)
     selected_rid = action_relation_id("long_horizon_error", "prediction_head", "repair_output_projection")
     actual_rid = action_relation_id("long_horizon_error", "temporal_memory", "add_temporal_smoothing")
-    selected_before = state["action_memory"]["relations"][selected_rid]["trust"]
-    actual_before = state["action_memory"]["relations"][actual_rid]["trust"]
+    selected_before = action_memory[selected_rid]["trust"]
+    actual_before = action_memory[actual_rid]["trust"]
     patch_record = {
         "component": "temporal_memory",
         "edit_action": "add_temporal_smoothing",
@@ -330,8 +334,9 @@ def test_mismatch_updates_actual_relation_as_reduced_off_policy_evidence():
 
 def test_negative_memory_blocks_repeated_dataset_failure():
     state = initial_task_graph()
+    action_memory = ensure_action_memory(state)
     rid = action_relation_id("train_val_gap", "regularization", "increase_regularization")
-    rel = state["action_memory"]["relations"][rid]
+    rel = action_memory[rid]
     rel["negative_count"] = 4
     rel["last_negative_update"] = 3
     rel["dataset_stats"] = {"FC2": {"negative_count": 3, "last_negative_update": 3}}
@@ -398,7 +403,7 @@ def test_high_entropy_attention_is_low_observability_not_sampling():
 
 def test_structural_exploration_requires_clear_evidence_gate():
     state = initial_task_graph()
-    relations = state["action_memory"]["relations"]
+    relations = ensure_action_memory(state)
     for rid, rel in relations.items():
         if rid.startswith("long_horizon_error->"):
             rel["alpha"] = 1.0

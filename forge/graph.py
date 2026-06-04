@@ -4,7 +4,6 @@ from datetime import datetime
 from typing import Any
 
 from .harness_spec import get_component_graph
-from .memory import ensure_action_memory
 from .trust import ensure_trust_relations
 
 
@@ -34,5 +33,4 @@ def initial_task_graph() -> dict[str, Any]:
         "created_at": _now(),
     }
     ensure_trust_relations(state)
-    ensure_action_memory(state)
     return state

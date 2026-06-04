@@ -1,8 +1,9 @@
+import json
 from argparse import Namespace
 
 import pytest
 
-from forge.cli import _parent_baseline_for_patch, _resolve_continue_target, build_parser
+from forge.cli import _maybe_refresh_parent_sweep_summary, _parent_baseline_for_patch, _resolve_continue_target, build_parser
 from forge.orchestrator import GraphOrchestrator
 
 
@@ -105,6 +106,45 @@ def test_summarize_sweep_parser_accepts_sweep_dir():
     parser = build_parser()
     args = parser.parse_args(["summarize-sweep", "--sweep-dir", "runs/demo_sweep"])
     assert args.sweep_dir == "runs/demo_sweep"
+
+
+def test_continue_refreshes_parent_sweep_summary(tmp_path):
+    sweep_root = tmp_path / "pilot"
+    fc1 = sweep_root / "FC1_L24_P12"
+    fc2 = sweep_root / "FC2_L24_P12"
+    fc1.mkdir(parents=True)
+    fc2.mkdir(parents=True)
+    (sweep_root / "sweep_summary.json").write_text(
+        json.dumps({"target_metric": "mae_inverse", "rows": []}),
+        encoding="utf-8",
+    )
+    (fc1 / "summary.json").write_text(
+        json.dumps({"best_target": 0.11, "best_run_dir": str(fc1 / "iter_020")}),
+        encoding="utf-8",
+    )
+    (fc2 / "summary.json").write_text(
+        json.dumps({"best_target": 0.22, "best_run_dir": str(fc2 / "iter_010")}),
+        encoding="utf-8",
+    )
+
+    refreshed = _maybe_refresh_parent_sweep_summary(fc1, "mae_inverse")
+
+    assert refreshed == sweep_root
+    summary = json.loads((sweep_root / "sweep_summary.json").read_text(encoding="utf-8"))
+    rows = {row["dataset"]: row for row in summary["rows"]}
+    assert rows["FC1"]["best_target"] == 0.11
+    assert rows["FC2"]["best_target"] == 0.22
+    assert (sweep_root / "sweep_summary.csv").exists()
+
+
+def test_standalone_combo_name_does_not_create_parent_sweep_summary(tmp_path):
+    run_root = tmp_path / "FC1_L24_P12"
+    run_root.mkdir()
+
+    refreshed = _maybe_refresh_parent_sweep_summary(run_root, "mae_inverse")
+
+    assert refreshed is None
+    assert not (tmp_path / "sweep_summary.json").exists()
 
 
 def test_parent_baseline_uses_recorded_best_parent(tmp_path):

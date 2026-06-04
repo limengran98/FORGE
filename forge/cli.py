@@ -37,6 +37,8 @@ from .paths import CONFIG_DIR, INITIAL_MODEL_PATH, PROJECT_ROOT, RUNS_DIR, ensur
 from .report import write_iteration_report
 from .routing import TRUST_ROUTING_MODES, route_feedback
 
+SWEEP_COMBO_RE = re.compile(r"^(?P<dataset>[^_]+)_L(?P<seq_len>\d+)_P(?P<pred_len>\d+)$")
+
 
 def _timestamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -531,6 +533,69 @@ def _write_sweep_outputs(rows: list[dict[str, Any]], sweep_root: Path, target_me
             writer.writerow({key: row.get(key) for key in fieldnames})
 
 
+def _collect_sweep_rows(sweep_root: Path, target_metric: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for child in sorted(path for path in sweep_root.iterdir() if path.is_dir()):
+        match = SWEEP_COMBO_RE.match(child.name)
+        if not match:
+            continue
+        row = {
+            "dataset": match.group("dataset"),
+            "seq_len": int(match.group("seq_len")),
+            "pred_len": int(match.group("pred_len")),
+            "success": False,
+            "best_target": None,
+            "best_run_dir": None,
+            "run_root": str(child),
+            "error": None,
+        }
+        summary_path = child / "summary.json"
+        if summary_path.exists():
+            summary = load_json(summary_path)
+            row["success"] = True
+            row["best_target"] = summary.get("best_target")
+            row["best_run_dir"] = summary.get("best_run_dir")
+        else:
+            graph_path = child / "task_graph.json"
+            if graph_path.exists():
+                state = load_json(graph_path)
+                failed = [
+                    (key, record)
+                    for key, record in state.get("iterations", {}).items()
+                    if record.get("status") == "failed"
+                ]
+                if failed:
+                    key, record = failed[-1]
+                    errors = [
+                        stage.get("error")
+                        for stage in record.get("stages", {}).values()
+                        if stage.get("status") == "failed" and stage.get("error")
+                    ]
+                    row["error"] = f"{key}: {errors[-1]}" if errors else f"{key}: failed"
+                else:
+                    row["error"] = "summary.json missing"
+            else:
+                row["error"] = "task_graph.json missing"
+        rows.append(row)
+    return rows
+
+
+def _refresh_sweep_summary(sweep_root: Path, target_metric: str) -> list[dict[str, Any]]:
+    rows = _collect_sweep_rows(sweep_root, target_metric)
+    _write_sweep_outputs(rows, sweep_root, target_metric)
+    return rows
+
+
+def _maybe_refresh_parent_sweep_summary(run_root: Path, target_metric: str) -> Path | None:
+    if not SWEEP_COMBO_RE.match(run_root.name):
+        return None
+    sweep_root = run_root.parent
+    if not (sweep_root / "sweep_summary.json").exists():
+        return None
+    _refresh_sweep_summary(sweep_root, target_metric)
+    return sweep_root
+
+
 def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     ensure_project_dirs()
     validate_harness_specs()
@@ -894,9 +959,12 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         current_iteration = next_iteration
 
     summary = _write_run_summary(run_root, to_round, target_metric, history)
+    refreshed_sweep = _maybe_refresh_parent_sweep_summary(run_root, target_metric)
     orchestrator.event("continue_finished", {"to_round": to_round})
     orchestrator.save()
     print(f"[FORGE] Continue finished. Summary: {run_root / 'summary.json'}")
+    if refreshed_sweep is not None:
+        print(f"[FORGE] Parent sweep summary refreshed: {refreshed_sweep / 'sweep_summary.json'}")
     return summary
 
 
@@ -974,52 +1042,7 @@ def cmd_summarize_sweep(args: argparse.Namespace) -> None:
     else:
         target_metric = "mae_inverse"
 
-    rows: list[dict[str, Any]] = []
-    pattern = re.compile(r"^(?P<dataset>[^_]+)_L(?P<seq_len>\d+)_P(?P<pred_len>\d+)$")
-    for child in sorted(path for path in sweep_root.iterdir() if path.is_dir()):
-        match = pattern.match(child.name)
-        if not match:
-            continue
-        row = {
-            "dataset": match.group("dataset"),
-            "seq_len": int(match.group("seq_len")),
-            "pred_len": int(match.group("pred_len")),
-            "success": False,
-            "best_target": None,
-            "best_run_dir": None,
-            "run_root": str(child),
-            "error": None,
-        }
-        summary_path = child / "summary.json"
-        if summary_path.exists():
-            summary = load_json(summary_path)
-            row["success"] = True
-            row["best_target"] = summary.get("best_target")
-            row["best_run_dir"] = summary.get("best_run_dir")
-        else:
-            graph_path = child / "task_graph.json"
-            if graph_path.exists():
-                state = load_json(graph_path)
-                failed = [
-                    (key, record)
-                    for key, record in state.get("iterations", {}).items()
-                    if record.get("status") == "failed"
-                ]
-                if failed:
-                    key, record = failed[-1]
-                    errors = [
-                        stage.get("error")
-                        for stage in record.get("stages", {}).values()
-                        if stage.get("status") == "failed" and stage.get("error")
-                    ]
-                    row["error"] = f"{key}: {errors[-1]}" if errors else f"{key}: failed"
-                else:
-                    row["error"] = "summary.json missing"
-            else:
-                row["error"] = "task_graph.json missing"
-        rows.append(row)
-
-    _write_sweep_outputs(rows, sweep_root, target_metric)
+    _refresh_sweep_summary(sweep_root, target_metric)
     print(f"[FORGE] Sweep summary refreshed: {sweep_root / 'sweep_summary.json'}")
 
 

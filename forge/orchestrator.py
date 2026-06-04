@@ -10,7 +10,7 @@ from typing import Any, Iterator
 from .config import load_json, save_json
 from .graph import initial_task_graph
 from .harness_spec import get_component_graph, get_iteration_stages, load_orchestration_spec
-from .memory import ensure_action_memory, update_action_memory_from_outcome
+from .memory import update_action_memory_from_outcome
 from .trust import ensure_trust_relations, update_relations_from_outcome
 
 
@@ -62,7 +62,6 @@ class GraphOrchestrator:
         state["updated_at"] = _now()
         self._ensure_component_graph(state)
         ensure_trust_relations(state)
-        ensure_action_memory(state)
         save_json(state, self.graph_path)
         return state
 
