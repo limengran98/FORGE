@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -21,9 +22,17 @@ from .harness_spec import (
     validate_harness_specs,
 )
 from .llm import load_llm_config
+from .memory import build_pemfc_context
 from .model_io import read_model_source
 from .orchestrator import GraphOrchestrator
-from .patching import apply_candidate, heuristic_patch_source, request_llm_patch
+from .patching import (
+    apply_candidate,
+    heuristic_patch_source,
+    request_llm_patch,
+    request_llm_repair_patch,
+    safety_fallback_candidate,
+    save_failed_candidate_attempt,
+)
 from .paths import CONFIG_DIR, INITIAL_MODEL_PATH, PROJECT_ROOT, RUNS_DIR, ensure_project_dirs
 from .report import write_iteration_report
 from .routing import route_feedback
@@ -237,6 +246,7 @@ def _generate_patch_for_next_iteration(
     next_dir.mkdir(parents=True, exist_ok=True)
     previous_source = read_model_source(current_model_path)
     candidate = None
+    llm_cfg = None
     if llm_mode in {"auto", "required"}:
         try:
             llm_cfg = load_llm_config(str(CONFIG_DIR / "forge_llm.yaml"))
@@ -256,29 +266,107 @@ def _generate_patch_for_next_iteration(
         candidate = heuristic_patch_source(previous_source, route)
 
     feature_dim = get_feature_dim()
-    try:
-        patch_meta = apply_candidate(
-            candidate,
-            current_model_path,
-            next_model_path,
-            _validation_config(hcfg),
-            feature_dim=feature_dim,
-            artifact_dir=next_dir,
-        )
-    except Exception as exc:
-        if llm_mode == "auto" and candidate.origin == "llm":
-            print(f"[FORGE] LLM patch failed validation, using heuristic fallback: {exc}")
-            candidate = heuristic_patch_source(previous_source, route)
+    validation_cfg = _validation_config(hcfg)
+    repair_attempts: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    max_repair_rounds = int((llm_cfg or {}).get("max_repair_rounds", 2)) if llm_cfg else 0
+    attempt = 0
+    while True:
+        try:
             patch_meta = apply_candidate(
                 candidate,
                 current_model_path,
                 next_model_path,
-                _validation_config(hcfg),
+                validation_cfg,
                 feature_dim=feature_dim,
                 artifact_dir=next_dir,
             )
-        else:
-            raise
+            patch_meta["repair_attempts"] = repair_attempts
+            break
+        except Exception as exc:
+            validation_error = f"{type(exc).__name__}: {exc}"
+            attempt_row = save_failed_candidate_attempt(candidate, next_dir, attempt, validation_error)
+            repair_attempts.append(attempt_row)
+            orchestrator.event(
+                "patch_validation_failed",
+                {
+                    "iteration": current_iteration,
+                    "next_iteration": next_iteration,
+                    "attempt": attempt,
+                    "origin": candidate.origin,
+                    "component": candidate.component,
+                    "error": validation_error,
+                    "source_path": attempt_row["source_path"],
+                },
+            )
+            seen_hashes.add(attempt_row["source_hash"])
+
+            can_repair = llm_cfg is not None and candidate.origin in {"llm", "llm_repair"} and attempt < max_repair_rounds
+            if can_repair:
+                try:
+                    repaired = request_llm_repair_patch(
+                        llm_cfg,
+                        next_iteration,
+                        feedback,
+                        route,
+                        previous_source,
+                        candidate,
+                        validation_error,
+                        history,
+                        repair_attempts,
+                        validation_cfg,
+                        feature_dim,
+                    )
+                    repaired_hash = save_failed_candidate_attempt(repaired, next_dir, attempt + 100, "pre_validation_snapshot")[
+                        "source_hash"
+                    ]
+                    if repaired_hash in seen_hashes:
+                        orchestrator.event(
+                            "patch_repair_duplicate",
+                            {
+                                "iteration": current_iteration,
+                                "next_iteration": next_iteration,
+                                "attempt": attempt,
+                            },
+                        )
+                    else:
+                        candidate = repaired
+                        attempt += 1
+                        continue
+                except Exception as repair_exc:
+                    repair_attempts.append(
+                        {
+                            "attempt": attempt,
+                            "origin": "llm_repair_call",
+                            "validation_error": f"{type(repair_exc).__name__}: {repair_exc}",
+                        }
+                    )
+
+            if llm_mode == "auto" and candidate.origin in {"llm", "llm_repair"}:
+                print(f"[FORGE] LLM patch failed validation, using heuristic fallback: {validation_error}")
+                candidate = heuristic_patch_source(previous_source, route)
+                attempt += 1
+                continue
+
+            fallback_reason = validation_error
+            print(f"[FORGE] Patch validation unresolved; using safety fallback: {fallback_reason}")
+            candidate = safety_fallback_candidate(previous_source, route, fallback_reason)
+            patch_meta = apply_candidate(
+                candidate,
+                current_model_path,
+                next_model_path,
+                validation_cfg,
+                feature_dim=feature_dim,
+                artifact_dir=next_dir,
+            )
+            patch_meta["repair_attempts"] = repair_attempts
+            patch_meta["validation_fallback"] = True
+            break
+    selected_edit = route.get("selected_edit") or {}
+    selected_operator = str(selected_edit.get("edit_operator") or "")
+    selected_component = str(selected_edit.get("component") or "")
+    actual_operator = str(patch_meta.get("edit_action") or "")
+    actual_component = str(patch_meta.get("component") or "")
     patch_meta["routed_component"] = route.get("primary_component")
     patch_meta["route_propagations"] = route.get("propagations") or []
     patch_meta["trust_before"] = {
@@ -286,6 +374,20 @@ def _generate_patch_for_next_iteration(
         for item in route.get("propagations", [])
         if item.get("relation_id")
     }
+    patch_meta["selected_edit"] = selected_edit
+    patch_meta["edit_candidates"] = route.get("edit_candidates") or []
+    patch_meta["negative_memory"] = route.get("negative_memory") or []
+    patch_meta["memory_context"] = route.get("memory_context") or feedback.get("pemfc_context") or {}
+    patch_meta["edit_operator_mismatch"] = bool(
+        selected_operator
+        and patch_meta.get("origin") in {"llm", "llm_repair"}
+        and (not actual_operator or actual_operator != selected_operator)
+    )
+    patch_meta["component_mismatch"] = bool(
+        selected_component
+        and patch_meta.get("origin") in {"llm", "llm_repair"}
+        and (not actual_component or actual_component != selected_component)
+    )
     patch_meta["parent_model_path"] = str(current_model_path)
     save_json(patch_meta, next_dir / "patch_meta.json")
     orchestrator.record_patch(current_iteration, patch_meta)
@@ -420,6 +522,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         with orchestrator.stage(iteration, "feedback", {"target_metric": target_metric}):
             feedback = encode_feedback(result, previous_result, best_before, target_metric=target_metric)
+            feedback["pemfc_context"] = build_pemfc_context(feedback, result=result, harness_config=hcfg)
             feedback_path = iter_dir / "feedback_vector.json"
             save_json(feedback, feedback_path)
             orchestrator.record_artifact(iteration, "feedback_vector", feedback_path)
@@ -475,8 +578,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         with orchestrator.stage(iteration, "report"):
             report_path = iter_dir / "report.md"
-            trust_updates = orchestrator.state["iterations"][f"iter_{iteration:03d}"].get("trust_updates", [])
-            write_iteration_report(report_path, iteration, result, feedback, route, patch_meta, trust_updates)
+            iteration_record = orchestrator.state["iterations"][f"iter_{iteration:03d}"]
+            trust_updates = iteration_record.get("trust_updates", [])
+            action_updates = iteration_record.get("action_memory_updates", [])
+            write_iteration_report(report_path, iteration, result, feedback, route, patch_meta, trust_updates, action_updates)
             orchestrator.record_artifact(iteration, "report", report_path)
         orchestrator.finish_iteration(iteration)
 
@@ -560,6 +665,8 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         )
         result = _load_iteration_json(orchestrator, current_iteration, "result")
         feedback = _load_iteration_json(orchestrator, current_iteration, "feedback_vector")
+        if not feedback.get("pemfc_context"):
+            feedback["pemfc_context"] = build_pemfc_context(feedback, result=result, harness_config=hcfg)
         route = _load_iteration_json(orchestrator, current_iteration, "routing")
         current_row = next((row for row in history if row.get("iteration") == current_iteration), None)
         if current_row is not None:
@@ -611,7 +718,17 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
             with orchestrator.stage(current_iteration, "report", {"resume": True, "patch_refresh": True}):
                 report_path = run_root / current_key / "report.md"
                 trust_updates = current_record.get("trust_updates", [])
-                write_iteration_report(report_path, current_iteration, result, feedback, route, patch_meta, trust_updates)
+                action_updates = current_record.get("action_memory_updates", [])
+                write_iteration_report(
+                    report_path,
+                    current_iteration,
+                    result,
+                    feedback,
+                    route,
+                    patch_meta,
+                    trust_updates,
+                    action_updates,
+                )
                 orchestrator.record_artifact(current_iteration, "report", report_path)
             orchestrator.finish_iteration(current_iteration)
 
@@ -632,6 +749,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         best_before = _best_result(history, target_metric)
         with orchestrator.stage(next_iteration, "feedback", {"target_metric": target_metric, "resume": True}):
             next_feedback = encode_feedback(next_result, previous_result, best_before, target_metric=target_metric)
+            next_feedback["pemfc_context"] = build_pemfc_context(next_feedback, result=next_result, harness_config=hcfg)
             feedback_path = next_dir / "feedback_vector.json"
             save_json(next_feedback, feedback_path)
             orchestrator.record_artifact(next_iteration, "feedback_vector", feedback_path)
@@ -661,8 +779,19 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
 
         with orchestrator.stage(next_iteration, "report", {"resume": True}):
             report_path = next_dir / "report.md"
-            trust_updates = orchestrator.state["iterations"][f"iter_{next_iteration:03d}"].get("trust_updates", [])
-            write_iteration_report(report_path, next_iteration, next_result, next_feedback, next_route, None, trust_updates)
+            next_record = orchestrator.state["iterations"][f"iter_{next_iteration:03d}"]
+            trust_updates = next_record.get("trust_updates", [])
+            action_updates = next_record.get("action_memory_updates", [])
+            write_iteration_report(
+                report_path,
+                next_iteration,
+                next_result,
+                next_feedback,
+                next_route,
+                None,
+                trust_updates,
+                action_updates,
+            )
             orchestrator.record_artifact(next_iteration, "report", report_path)
         orchestrator.finish_iteration(next_iteration)
         current_iteration = next_iteration
@@ -734,6 +863,67 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                 _write_sweep_outputs(rows, sweep_root, target_metric)
 
     print(f"[FORGE] Sweep finished. Summary: {sweep_root / 'sweep_summary.json'}")
+
+
+def cmd_summarize_sweep(args: argparse.Namespace) -> None:
+    sweep_root = Path(args.sweep_dir).expanduser().resolve()
+    if not sweep_root.exists():
+        raise FileNotFoundError(f"Sweep directory does not exist: {sweep_root}")
+    existing_summary = sweep_root / "sweep_summary.json"
+    if args.target_metric:
+        target_metric = args.target_metric
+    elif existing_summary.exists():
+        target_metric = str(load_json(existing_summary).get("target_metric") or "mae_inverse")
+    else:
+        target_metric = "mae_inverse"
+
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(r"^(?P<dataset>[^_]+)_L(?P<seq_len>\d+)_P(?P<pred_len>\d+)$")
+    for child in sorted(path for path in sweep_root.iterdir() if path.is_dir()):
+        match = pattern.match(child.name)
+        if not match:
+            continue
+        row = {
+            "dataset": match.group("dataset"),
+            "seq_len": int(match.group("seq_len")),
+            "pred_len": int(match.group("pred_len")),
+            "success": False,
+            "best_target": None,
+            "best_run_dir": None,
+            "run_root": str(child),
+            "error": None,
+        }
+        summary_path = child / "summary.json"
+        if summary_path.exists():
+            summary = load_json(summary_path)
+            row["success"] = True
+            row["best_target"] = summary.get("best_target")
+            row["best_run_dir"] = summary.get("best_run_dir")
+        else:
+            graph_path = child / "task_graph.json"
+            if graph_path.exists():
+                state = load_json(graph_path)
+                failed = [
+                    (key, record)
+                    for key, record in state.get("iterations", {}).items()
+                    if record.get("status") == "failed"
+                ]
+                if failed:
+                    key, record = failed[-1]
+                    errors = [
+                        stage.get("error")
+                        for stage in record.get("stages", {}).values()
+                        if stage.get("status") == "failed" and stage.get("error")
+                    ]
+                    row["error"] = f"{key}: {errors[-1]}" if errors else f"{key}: failed"
+                else:
+                    row["error"] = "summary.json missing"
+            else:
+                row["error"] = "task_graph.json missing"
+        rows.append(row)
+
+    _write_sweep_outputs(rows, sweep_root, target_metric)
+    print(f"[FORGE] Sweep summary refreshed: {sweep_root / 'sweep_summary.json'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -819,6 +1009,11 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument("--layer", type=int, default=None)
     sweep_p.add_argument("--dropout", type=float, default=None)
     sweep_p.set_defaults(func=cmd_sweep)
+
+    summarize_p = sub.add_parser("summarize-sweep", help="refresh sweep summary from child run summaries")
+    summarize_p.add_argument("--sweep-dir", required=True)
+    summarize_p.add_argument("--target-metric", default=None)
+    summarize_p.set_defaults(func=cmd_summarize_sweep)
 
     return parser
 

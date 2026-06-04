@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,7 +66,15 @@ def heuristic_patch_source(_previous_source: str, route: dict[str, Any]) -> Patc
 
 
 def _load_patch_prompt() -> dict[str, str]:
-    prompt_path = PROMPTS_DIR / "model_patch.yaml"
+    return _load_prompt_file("model_patch.yaml")
+
+
+def _load_repair_prompt() -> dict[str, str]:
+    return _load_prompt_file("model_repair.yaml")
+
+
+def _load_prompt_file(name: str) -> dict[str, str]:
+    prompt_path = PROMPTS_DIR / name
     prompt = load_yaml(prompt_path)
     return {
         "system": str(prompt.get("system", "")),
@@ -92,6 +101,10 @@ def _format_user_prompt(
     if not template:
         return json.dumps(payload, indent=2, ensure_ascii=False)
     return template.replace("${payload_json}", json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _candidate_hash(source: str) -> str:
+    return hashlib.md5(source.strip().encode("utf-8")).hexdigest()
 
 
 def request_llm_patch(
@@ -126,6 +139,104 @@ def request_llm_patch(
         edit_action=str(response.get("edit_action", "")),
         raw_response=response,
     )
+
+
+def request_llm_repair_patch(
+    llm_config: dict[str, Any],
+    iteration: int,
+    feedback: dict[str, Any],
+    route: dict[str, Any],
+    parent_source: str,
+    broken_candidate: PatchCandidate,
+    validation_error: str,
+    history: list[dict[str, Any]],
+    failed_attempts: list[dict[str, Any]],
+    validation_config: SimpleNamespace,
+    feature_dim: int,
+) -> PatchCandidate:
+    prompt = _load_repair_prompt()
+    payload = {
+        "iteration": iteration,
+        "harness_spec": load_pemfc_harness_spec(),
+        "validation_contract": {
+            "input_shape": ["batch", int(validation_config.seq_len), int(feature_dim)],
+            "expected_output_shape": ["batch", int(validation_config.pred_len), int(validation_config.enc_in)],
+            "seq_len": int(validation_config.seq_len),
+            "pred_len": int(validation_config.pred_len),
+            "enc_in": int(validation_config.enc_in),
+            "feature_dim": int(feature_dim),
+        },
+        "feedback": feedback,
+        "routing": route,
+        "history": history[-8:],
+        "parent_working_model_source": parent_source,
+        "broken_candidate": {
+            "component": broken_candidate.component,
+            "origin": broken_candidate.origin,
+            "edit_action": broken_candidate.edit_action,
+            "summary": broken_candidate.summary,
+            "rationale": broken_candidate.rationale,
+            "source": broken_candidate.source,
+        },
+        "validation_error": validation_error,
+        "failed_attempts": failed_attempts[-3:],
+    }
+    user_text = prompt["user_template"].replace("${payload_json}", json.dumps(payload, indent=2, ensure_ascii=False))
+    response = chat_json(
+        [
+            {"role": "system", "content": prompt["system"]},
+            {"role": "user", "content": user_text},
+        ],
+        llm_config,
+    )
+    source = response.get("full_source") or response.get("source") or ""
+    class_name = get_model_class_name()
+    if not isinstance(source, str) or f"class {class_name}" not in source:
+        raise ValueError(f"LLM repair response must include full_source defining class {class_name}")
+    return PatchCandidate(
+        source=source.strip() + "\n",
+        rationale=str(response.get("rationale", "")),
+        summary=str(response.get("summary", "")),
+        component=str(response.get("component", broken_candidate.component or route.get("primary_component", ""))),
+        origin="llm_repair",
+        edit_action=str(response.get("edit_action", "repair_validation_error")),
+        raw_response=response,
+    )
+
+
+def safety_fallback_candidate(parent_source: str, route: dict[str, Any], reason: str) -> PatchCandidate:
+    return PatchCandidate(
+        source=parent_source.strip() + "\n",
+        rationale=f"Safety fallback after unresolved patch validation error: {reason}",
+        summary="Reuses the parent working model to keep the fixed harness iteration alive.",
+        component=str(route.get("primary_component", "interface")),
+        origin="safety_fallback",
+        edit_action="reuse_parent_after_failed_repair",
+        raw_response={"reason": reason},
+    )
+
+
+def save_failed_candidate_attempt(
+    candidate: PatchCandidate,
+    artifact_dir: str | Path,
+    attempt_index: int,
+    validation_error: str,
+) -> dict[str, Any]:
+    artifact_dir = Path(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    source_path = artifact_dir / f"failed_candidate_{attempt_index:02d}.py"
+    source_path.write_text(candidate.source, encoding="utf-8")
+    row = {
+        "attempt": attempt_index,
+        "origin": candidate.origin,
+        "component": candidate.component,
+        "edit_action": candidate.edit_action,
+        "summary": candidate.summary,
+        "source_path": str(source_path),
+        "source_hash": _candidate_hash(candidate.source),
+        "validation_error": validation_error,
+    }
+    return row
 
 
 def apply_candidate(

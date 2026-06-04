@@ -190,6 +190,45 @@ def update_relations_from_outcome(
 
     seen: set[str] = set()
     updates: list[dict[str, Any]] = []
+    if patch_record.get("validation_fallback"):
+        for item in selected:
+            diagnostic = str(item.get("diagnostic"))
+            target_component = str(item.get("component") or component)
+            rid = relation_id(diagnostic, target_component)
+            if rid in seen or rid not in relations:
+                continue
+            seen.add(rid)
+            rel = relations[rid]
+            trust_before = relation_trust(state, diagnostic, target_component)
+            update_amount = 0.25
+            rel["beta"] = _safe_float(rel.get("beta"), 1.0) + update_amount
+            rel["n"] = int(rel.get("n", 0)) + 1
+            rel["trust"] = relation_trust(state, diagnostic, target_component)
+            rel["updated_at"] = _now()
+            evidence = {
+                "ts": _now(),
+                "diagnostic": diagnostic,
+                "component": target_component,
+                "trust_before": trust_before,
+                "trust_after": rel["trust"],
+                "direction": "decrease",
+                "update_amount": update_amount,
+                "reward": {
+                    "reward": -update_amount,
+                    "reason": "patch_validation_fallback",
+                    "target_delta": None,
+                    "diagnostic_delta": None,
+                    "overfit_delta": None,
+                },
+                "previous_target": _target(previous_result, target_metric),
+                "next_target": _target(next_result, target_metric),
+                "previous_result_path": previous_result.get("paths", {}).get("result"),
+                "next_result_path": next_result.get("paths", {}).get("result"),
+            }
+            rel.setdefault("evidence", []).append(evidence)
+            updates.append(evidence)
+        return updates
+
     for item in selected:
         diagnostic = str(item.get("diagnostic"))
         target_component = str(item.get("component") or component)

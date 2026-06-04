@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .harness_spec import get_component_graph, get_routing_policy
+from .memory import build_pemfc_context, select_edit_candidates
 from .trust import (
     candidate_components_for_diagnostic,
     diagnostic_message,
@@ -134,6 +135,20 @@ def route_feedback(
         for edge in component_graph["edges"]
         if edge["from"] in active_nodes or edge["to"] in active_nodes
     ]
+    action_selection: dict[str, Any] = {
+        "selected_edit": None,
+        "edit_candidates": [],
+        "negative_memory": [],
+        "memory_context": feedback.get("pemfc_context") or build_pemfc_context(feedback),
+    }
+    if mode in {"prior", "trust"}:
+        action_selection = select_edit_candidates(
+            feedback,
+            graph_state,
+            active_nodes,
+            propagations,
+            mode=mode,
+        )
 
     trust_policy = {"rule": "rule_only", "prior": "trust_prior_only", "trust": "trust_graph_v1"}[mode]
     if mode == "trust" and graph_state is None:
@@ -145,6 +160,10 @@ def route_feedback(
         "scores": {node: round(score, 4) for node, score in ranked},
         "reasons": {node: vals for node, vals in reasons.items() if vals},
         "propagations": sorted(propagations, key=lambda item: item["contribution"], reverse=True),
+        "selected_edit": action_selection.get("selected_edit"),
+        "edit_candidates": action_selection.get("edit_candidates") or [],
+        "negative_memory": action_selection.get("negative_memory") or [],
+        "memory_context": action_selection.get("memory_context") or {},
         "trust_policy": trust_policy,
         "component_graph": component_graph,
         "active_subgraph": {

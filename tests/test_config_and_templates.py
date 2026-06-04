@@ -2,9 +2,10 @@ from types import SimpleNamespace
 
 from forge.config import load_experiment_config
 from forge.harness import _resolve_device, validate_harness_config
-from forge.harness_spec import get_benchmark_grid, get_enc_in, get_feature_dim, validate_harness_specs
+from forge.harness_spec import get_benchmark_grid, get_edit_operators, get_enc_in, get_feature_dim, validate_harness_specs
 from forge.model_io import validate_model_source
-from forge.patching import heuristic_patch_source
+from forge.patching import apply_candidate, heuristic_patch_source, safety_fallback_candidate, save_failed_candidate_attempt
+from forge.paths import INITIAL_MODEL_PATH
 
 
 def test_default_device_is_cuda_zero():
@@ -22,6 +23,14 @@ def test_benchmark_grid_matches_table_protocol():
     assert grid["datasets"] == ["FC1", "FC2"]
     assert grid["seq_lens"] == [12, 24, 48, 96, 192]
     assert grid["pred_lens"] == [1, 3, 6, 12]
+
+
+def test_edit_operator_library_is_configured():
+    operators = get_edit_operators()
+    ids = {item["id"] for item in operators}
+    assert "add_temporal_smoothing" in ids
+    assert "increase_regularization" in ids
+    assert all(item.get("component") for item in operators)
 
 
 def test_cpu_device_resolution_is_explicit():
@@ -65,3 +74,35 @@ def test_heuristic_template_is_loaded_from_skill_file():
     )
     validate_model_source(candidate.source, cfg, feature_dim=get_feature_dim())
     assert candidate.origin == "heuristic"
+
+
+def test_safety_fallback_candidate_reuses_valid_parent_model(tmp_path):
+    parent_source = INITIAL_MODEL_PATH.read_text(encoding="utf-8")
+    candidate = safety_fallback_candidate(parent_source, {"primary_component": "temporal_memory"}, "shape error")
+    cfg = SimpleNamespace(
+        seq_len=24,
+        pred_len=12,
+        enc_in=get_enc_in(),
+        hidden_dim=16,
+        layer=1,
+        dropout=0.1,
+        feature_dim=get_feature_dim(),
+    )
+    meta = apply_candidate(
+        candidate,
+        INITIAL_MODEL_PATH,
+        tmp_path / "model.py",
+        cfg,
+        feature_dim=get_feature_dim(),
+        artifact_dir=tmp_path,
+    )
+    assert meta["origin"] == "safety_fallback"
+    assert (tmp_path / "model.py").exists()
+
+
+def test_failed_candidate_attempt_is_saved_for_repair_audit(tmp_path):
+    candidate = safety_fallback_candidate("class ForgeModel: pass\n", {"primary_component": "interface"}, "boom")
+    row = save_failed_candidate_attempt(candidate, tmp_path, 0, "RuntimeError: boom")
+    assert row["attempt"] == 0
+    assert row["source_path"]
+    assert (tmp_path / "failed_candidate_00.py").exists()

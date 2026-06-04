@@ -64,9 +64,16 @@ def validate_model_source(source: str, configs: SimpleNamespace, feature_dim: in
 
     model.eval()
     x = torch.randn(2, int(configs.seq_len), int(feature_dim))
-    with torch.no_grad():
-        y = model(x)
     expected = (2, int(configs.pred_len), int(configs.enc_in))
+    with torch.no_grad():
+        try:
+            y = model(x)
+        except Exception as exc:
+            raise ModelInterfaceError(
+                "Candidate forward failed during interface validation: "
+                f"input_shape={tuple(x.shape)}, expected_output_shape={expected}, "
+                f"error={type(exc).__name__}: {exc}"
+            ) from exc
     if tuple(y.shape) != expected:
         raise ModelInterfaceError(f"Forward output shape {tuple(y.shape)} != expected {expected}")
     if not torch.isfinite(y).all():

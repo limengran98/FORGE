@@ -1,0 +1,112 @@
+name: edit_operator_library_v1
+description: Relation-level local edit operators for controlled FORGE model refinement.
+
+default_operator_prior: 0.45
+prior_strength: 2.0
+
+selection:
+  max_candidates: 8
+  exploration_bonus: 0.02
+  negative_penalty: 0.10
+
+update:
+  target_weight: 0.25
+  diagnostic_weight: 0.65
+  overfit_penalty_weight: 0.10
+  positive_threshold: 0.002
+  negative_threshold: -0.002
+  update_scale: 2.0
+  max_update: 1.0
+  validation_failure_penalty: 0.35
+
+operators:
+  - id: preserve_harness_contract
+    component: interface
+    risk: low
+    diagnostics:
+      harness_failure: 0.80
+      shape_contract_error: 0.70
+    description: Keep imports, class name, constructor arguments, and forward signature compatible with the fixed harness.
+    prompt_guidance: Repair only interface or shape-contract logic; preserve batch-derived dimensions and return [batch, pred_len, enc_in].
+
+  - id: repair_output_projection
+    component: prediction_head
+    risk: low
+    diagnostics:
+      shape_contract_error: 0.95
+      long_horizon_error: 0.55
+      channel_imbalance: 0.60
+      train_val_gap: 0.35
+    description: Adjust the final projection or reshape path without changing the temporal encoder contract.
+    prompt_guidance: Keep projection local to the head; derive batch from x.shape[0] and reshape only with self.pred_len and self.enc_in.
+
+  - id: add_temporal_smoothing
+    component: temporal_memory
+    risk: medium
+    diagnostics:
+      residual_autocorrelation: 0.82
+      long_horizon_error: 0.78
+      residual_drift: 0.55
+      late_life_error: 0.55
+    description: Add a small residual temporal smoother or gated recurrent refinement on top of the existing sequence encoding.
+    prompt_guidance: Make a local temporal-memory edit; do not change output shape, factor inputs, or harness API.
+
+  - id: add_degradation_trend_bias
+    component: temporal_memory
+    risk: medium
+    diagnostics:
+      late_life_error: 0.80
+      residual_drift: 0.72
+      long_horizon_error: 0.60
+    description: Add a monotone/time-aware degradation trend pathway for late chronological test errors.
+    prompt_guidance: Use the time feature or sequence index conservatively; avoid hard monotonic constraints that can dominate all channels.
+
+  - id: calibrate_factor_gate
+    component: factor_fusion
+    risk: medium
+    diagnostics:
+      dynamic_load_error: 0.86
+      residual_drift: 0.45
+    description: Improve how operating-condition factors modulate voltage embeddings.
+    prompt_guidance: Keep the edit in factor fusion or gating; do not replace the full temporal encoder.
+
+  - id: normalize_factor_path
+    component: normalization
+    risk: low
+    diagnostics:
+      nan_instability: 0.78
+      residual_drift: 0.72
+      val_curve_instability: 0.58
+      channel_imbalance: 0.55
+    description: Stabilize feature/factor scale before embedding or fusion.
+    prompt_guidance: Prefer LayerNorm, bounded gates, or local scale parameters; avoid changing dataset preprocessing.
+
+  - id: add_embedding_residual
+    component: input_embedding
+    risk: medium
+    diagnostics:
+      residual_autocorrelation: 0.48
+      dynamic_load_error: 0.50
+    description: Add a small residual embedding path to preserve voltage/factor information.
+    prompt_guidance: Modify only input embedding/fusion entry; keep downstream hidden sizes compatible.
+
+  - id: increase_regularization
+    component: regularization
+    risk: low
+    diagnostics:
+      train_val_gap: 0.90
+      target_degradation: 0.65
+      val_curve_instability: 0.45
+    description: Add or tune dropout, weight decay-like local penalties, or capacity damping when train/validation gap is high.
+    prompt_guidance: Make a small regularization edit; avoid changing multiple architecture families at once.
+
+  - id: conservative_optimizer_stability
+    component: optimization
+    risk: low
+    diagnostics:
+      nan_instability: 0.72
+      val_curve_instability: 0.74
+      target_degradation: 0.55
+      train_val_gap: 0.40
+    description: Make model-internal training dynamics more stable without changing the harness optimizer.
+    prompt_guidance: Since the harness optimizer is fixed, use model-local bounded activations, normalization, or initialization.

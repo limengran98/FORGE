@@ -78,3 +78,9 @@ def test_continue_target_rejects_ambiguous_target():
     args = Namespace(to_round=3, additional_rounds=1)
     with pytest.raises(ValueError, match="Use either"):
         _resolve_continue_target(args, last_iteration=1)
+
+
+def test_summarize_sweep_parser_accepts_sweep_dir():
+    parser = build_parser()
+    args = parser.parse_args(["summarize-sweep", "--sweep-dir", "runs/demo_sweep"])
+    assert args.sweep_dir == "runs/demo_sweep"

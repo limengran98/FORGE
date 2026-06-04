@@ -10,6 +10,7 @@ from typing import Any, Iterator
 from .config import load_json, save_json
 from .graph import initial_task_graph
 from .harness_spec import get_component_graph, get_iteration_stages, load_orchestration_spec
+from .memory import ensure_action_memory, update_action_memory_from_outcome
 from .trust import ensure_trust_relations, update_relations_from_outcome
 
 
@@ -61,6 +62,7 @@ class GraphOrchestrator:
         state["updated_at"] = _now()
         self._ensure_component_graph(state)
         ensure_trust_relations(state)
+        ensure_action_memory(state)
         save_json(state, self.graph_path)
         return state
 
@@ -251,6 +253,10 @@ class GraphOrchestrator:
             "routing_policy": route.get("routing_policy"),
             "trust_policy": route.get("trust_policy"),
             "propagations": route.get("propagations") or [],
+            "selected_edit": route.get("selected_edit"),
+            "edit_candidates": route.get("edit_candidates") or [],
+            "negative_memory": route.get("negative_memory") or [],
+            "memory_context": route.get("memory_context") or {},
         }
         self._update_component_evidence(iteration, route, result, feedback)
         self.event(
@@ -327,7 +333,14 @@ class GraphOrchestrator:
             "routed_component": patch_meta.get("routed_component"),
             "route_propagations": patch_meta.get("route_propagations") or [],
             "trust_before": patch_meta.get("trust_before") or {},
+            "selected_edit": patch_meta.get("selected_edit"),
+            "edit_candidates": patch_meta.get("edit_candidates") or [],
+            "negative_memory": patch_meta.get("negative_memory") or [],
+            "memory_context": patch_meta.get("memory_context") or {},
             "edit_action": patch_meta.get("edit_action"),
+            "edit_operator_mismatch": bool(patch_meta.get("edit_operator_mismatch", False)),
+            "repair_attempts": patch_meta.get("repair_attempts") or [],
+            "validation_fallback": bool(patch_meta.get("validation_fallback", False)),
         }
         for key in ("output_model_path", "diff_path"):
             if patch_meta.get(key):
@@ -348,38 +361,73 @@ class GraphOrchestrator:
         patch_record = self._iteration_record(patch_iteration).get("patch", {})
         if not patch_record:
             return []
-        existing = self._iteration_record(outcome_iteration).get("trust_updates", [])
-        if existing:
-            return list(existing)
-        updates = update_relations_from_outcome(
-            self.state,
-            patch_record,
-            previous_result,
-            next_result,
-            previous_feedback,
-            next_feedback,
-            target_metric,
-        )
         outcome_record = self._iteration_record(outcome_iteration)
-        outcome_record["trust_updates"] = updates
+        existing = outcome_record.get("trust_updates", [])
+        if existing:
+            updates = list(existing)
+        else:
+            updates = update_relations_from_outcome(
+                self.state,
+                patch_record,
+                previous_result,
+                next_result,
+                previous_feedback,
+                next_feedback,
+                target_metric,
+            )
+            outcome_record["trust_updates"] = updates
+            self.event(
+                "trust_updated",
+                {
+                    "patch_iteration": patch_iteration,
+                    "outcome_iteration": outcome_iteration,
+                    "updates": [
+                        {
+                            "diagnostic": item.get("diagnostic"),
+                            "component": item.get("component"),
+                            "trust_before": item.get("trust_before"),
+                            "trust_after": item.get("trust_after"),
+                            "direction": item.get("direction"),
+                        }
+                        for item in updates
+                    ],
+                },
+            )
+
+        existing_action = outcome_record.get("action_memory_updates", [])
+        if existing_action:
+            action_updates = list(existing_action)
+        else:
+            action_updates = update_action_memory_from_outcome(
+                self.state,
+                patch_record,
+                previous_result,
+                next_result,
+                previous_feedback,
+                next_feedback,
+                target_metric,
+            )
+            outcome_record["action_memory_updates"] = action_updates
+            self.event(
+                "action_memory_updated",
+                {
+                    "patch_iteration": patch_iteration,
+                    "outcome_iteration": outcome_iteration,
+                    "updates": [
+                        {
+                            "diagnostic": item.get("diagnostic"),
+                            "component": item.get("component"),
+                            "edit_operator": item.get("edit_operator"),
+                            "trust_before": item.get("trust_before"),
+                            "trust_after": item.get("trust_after"),
+                            "direction": item.get("direction"),
+                            "candidate_status": item.get("candidate_status"),
+                        }
+                        for item in action_updates
+                    ],
+                },
+            )
         outcome_record["updated_at"] = _now()
-        self.event(
-            "trust_updated",
-            {
-                "patch_iteration": patch_iteration,
-                "outcome_iteration": outcome_iteration,
-                "updates": [
-                    {
-                        "diagnostic": item.get("diagnostic"),
-                        "component": item.get("component"),
-                        "trust_before": item.get("trust_before"),
-                        "trust_after": item.get("trust_after"),
-                        "direction": item.get("direction"),
-                    }
-                    for item in updates
-                ],
-            },
-        )
         self.save()
         return updates
 

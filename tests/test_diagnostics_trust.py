@@ -2,6 +2,7 @@ import numpy as np
 
 from forge.diagnostics import diagnose_result
 from forge.graph import initial_task_graph
+from forge.memory import action_relation_id, update_action_memory_from_outcome
 from forge.routing import route_feedback
 from forge.trust import relation_id, update_relations_from_outcome
 
@@ -42,6 +43,9 @@ def test_trust_routing_records_feedback_component_propagation():
     relation_ids = {item["relation_id"] for item in route["propagations"]}
     assert relation_id("long_horizon_error", "temporal_memory") in relation_ids
     assert "temporal_memory" in route["active_components"]
+    assert route["selected_edit"]["component"] == "temporal_memory"
+    assert route["selected_edit"]["edit_operator"] == "add_temporal_smoothing"
+    assert route["edit_candidates"]
 
 
 def test_rule_routing_mode_disables_trust_propagation():
@@ -101,3 +105,92 @@ def test_negative_executable_outcome_decreases_relation_trust():
     )
     assert updates[0]["direction"] == "decrease"
     assert state["relations"][rid]["trust"] < before
+
+
+def test_validation_fallback_does_not_reward_noop_metrics():
+    state = initial_task_graph()
+    rid = relation_id("long_horizon_error", "temporal_memory")
+    before = state["relations"][rid]["trust"]
+    patch_record = {
+        "component": "temporal_memory",
+        "validation_fallback": True,
+        "route_propagations": [
+            {"diagnostic": "long_horizon_error", "component": "temporal_memory"},
+        ],
+    }
+    previous_result = {
+        "success": True,
+        "metrics": {"target": {"mae_inverse": 1.0}},
+        "paths": {"result": "prev.json"},
+    }
+    next_result = {
+        "success": True,
+        "metrics": {"target": {"mae_inverse": 0.5}},
+        "paths": {"result": "next.json"},
+    }
+    previous_feedback = {
+        "features": {"overfit_score": 0.1},
+        "diagnostics": [{"name": "long_horizon_error", "severity": 0.7, "confidence": 1.0}],
+    }
+    next_feedback = {
+        "features": {"overfit_score": 0.1},
+        "diagnostics": [{"name": "long_horizon_error", "severity": 0.2, "confidence": 1.0}],
+    }
+
+    updates = update_relations_from_outcome(
+        state,
+        patch_record,
+        previous_result,
+        next_result,
+        previous_feedback,
+        next_feedback,
+        "mae_inverse",
+    )
+    assert updates[0]["reward"]["reason"] == "patch_validation_fallback"
+    assert state["relations"][rid]["trust"] < before
+
+
+def test_action_memory_updates_feedback_component_edit_relation():
+    state = initial_task_graph()
+    rid = action_relation_id("long_horizon_error", "temporal_memory", "add_temporal_smoothing")
+    before = state["action_memory"]["relations"][rid]["trust"]
+    patch_record = {
+        "component": "temporal_memory",
+        "selected_edit": {
+            "diagnostic": "long_horizon_error",
+            "component": "temporal_memory",
+            "edit_operator": "add_temporal_smoothing",
+        },
+    }
+    previous_result = {
+        "success": True,
+        "metrics": {"target": {"mae_inverse": 1.0}},
+        "paths": {"result": "prev.json"},
+    }
+    next_result = {
+        "success": True,
+        "metrics": {"target": {"mae_inverse": 1.2}},
+        "paths": {"result": "next.json"},
+    }
+    previous_feedback = {
+        "features": {"overfit_score": 0.1},
+        "diagnostics": [{"name": "long_horizon_error", "severity": 0.8, "confidence": 1.0}],
+    }
+    next_feedback = {
+        "features": {"overfit_score": 0.3},
+        "diagnostics": [{"name": "long_horizon_error", "severity": 0.9, "confidence": 1.0}],
+    }
+
+    updates = update_action_memory_from_outcome(
+        state,
+        patch_record,
+        previous_result,
+        next_result,
+        previous_feedback,
+        next_feedback,
+        "mae_inverse",
+    )
+    rel = state["action_memory"]["relations"][rid]
+    assert updates[0]["direction"] == "decrease"
+    assert rel["trust"] < before
+    assert state["action_memory"]["negative_experiences"]

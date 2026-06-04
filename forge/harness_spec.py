@@ -42,6 +42,11 @@ def load_trust_policy_spec() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
+def load_edit_operator_spec() -> dict[str, Any]:
+    return _load_named_yaml("edit_operators.yaml")
+
+
+@lru_cache(maxsize=1)
 def load_heuristic_patch_spec() -> dict[str, Any]:
     return _load_named_yaml("heuristic_patches.yaml")
 
@@ -150,6 +155,17 @@ def get_trust_policy() -> dict[str, Any]:
     return load_trust_policy_spec()
 
 
+def get_edit_operator_spec() -> dict[str, Any]:
+    return load_edit_operator_spec()
+
+
+def get_edit_operators() -> list[dict[str, Any]]:
+    operators = load_edit_operator_spec().get("operators", [])
+    if not operators:
+        raise ValueError("edit_operators.yaml must define at least one operator")
+    return list(operators)
+
+
 def resolve_project_path(path: str | Path) -> Path:
     path = Path(path)
     if path.is_absolute():
@@ -221,12 +237,35 @@ def validate_harness_specs() -> None:
     if not priors:
         raise ValueError("trust_policy.yaml must define diagnostic_component_priors")
     known_components = set(get_component_graph()["nodes"])
+    known_diagnostics = set(priors)
     for diagnostic, component_priors in priors.items():
         if not isinstance(component_priors, dict) or not component_priors:
             raise ValueError(f"trust prior for {diagnostic!r} must map to at least one component")
         unknown = [component for component in component_priors if component not in known_components]
         if unknown:
             raise ValueError(f"trust prior for {diagnostic!r} references unknown components: {unknown}")
+
+    edit_operator_ids: set[str] = set()
+    for operator in get_edit_operators():
+        op_id = str(operator.get("id") or "")
+        component = str(operator.get("component") or "")
+        diagnostics = operator.get("diagnostics", {})
+        if not op_id:
+            raise ValueError("Each edit operator must define an id")
+        if op_id in edit_operator_ids:
+            raise ValueError(f"Duplicate edit operator id: {op_id}")
+        edit_operator_ids.add(op_id)
+        if component not in known_components:
+            raise ValueError(f"Edit operator {op_id!r} references unknown component: {component}")
+        if not isinstance(diagnostics, dict) or not diagnostics:
+            raise ValueError(f"Edit operator {op_id!r} must define diagnostic priors")
+        unknown_diagnostics = [name for name in diagnostics if name not in known_diagnostics]
+        if unknown_diagnostics:
+            raise ValueError(f"Edit operator {op_id!r} references unknown diagnostics: {unknown_diagnostics}")
+        for diagnostic, prior in diagnostics.items():
+            value = float(prior)
+            if not (0.0 < value < 1.0):
+                raise ValueError(f"Edit operator prior for {op_id!r}/{diagnostic!r} must be in (0, 1)")
 
     get_component_graph()
     get_iteration_stages()
