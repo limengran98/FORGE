@@ -39,6 +39,20 @@ def _load_template_source(template_path: str) -> str:
 
 
 def heuristic_patch_source(_previous_source: str, route: dict[str, Any]) -> PatchCandidate:
+    selected_edit = route.get("selected_edit") or {}
+    selected_template = str(selected_edit.get("template") or "").strip()
+    if selected_template:
+        source = _load_template_source(selected_template)
+        return PatchCandidate(
+            source=source,
+            rationale=str(selected_edit.get("prompt_guidance") or "Deterministic template selected by relation-level routing."),
+            summary=str(selected_edit.get("description") or "Applies selected relation-level structural template."),
+            component=str(selected_edit.get("component") or route.get("primary_component", "temporal_memory")),
+            origin="heuristic",
+            edit_action=str(selected_edit.get("edit_operator") or "selected_template"),
+            raw_response={"selected_relation_id": selected_edit.get("relation_id"), "template": selected_template},
+        )
+
     component = route.get("primary_component", "factor_fusion")
     selected = None
     fallback = None

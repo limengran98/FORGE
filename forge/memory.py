@@ -218,13 +218,59 @@ def _risk_value(risk: str, rel: dict[str, Any]) -> float:
 def _expected_correction(rel: dict[str, Any]) -> float:
     values: list[float] = []
     for item in (rel.get("evidence") or [])[-5:]:
-        if item.get("evidence_policy") == "off_policy":
+        if str(item.get("evidence_policy", "")).startswith("off_policy"):
             continue
         reward = item.get("reward") or {}
         values.append(_safe_float(reward.get("reward")))
     if not values:
         return 0.0
     return _clip(sum(values) / len(values))
+
+
+def _success_score(positive_count: int, negative_count: int, neutral_count: int = 0) -> float:
+    total = max(0, positive_count) + max(0, negative_count) + max(0, neutral_count)
+    if total <= 0:
+        return 0.5
+    value = (max(0, positive_count) + 0.5 * max(0, neutral_count)) / total
+    return _clip01(value)
+
+
+def _dataset_success_score(rel: dict[str, Any], dataset: str, config: dict[str, Any]) -> float:
+    dataset_cfg = config.get("dataset_memory", {})
+    if not isinstance(dataset_cfg, dict):
+        dataset_cfg = {}
+    dataset_weight = _clip01(float(dataset_cfg.get("dataset_specific_weight", 0.7)))
+    global_weight = _clip01(float(dataset_cfg.get("global_weight", 0.3)))
+    norm = max(dataset_weight + global_weight, 1e-8)
+    dataset_weight /= norm
+    global_weight /= norm
+
+    global_score = _success_score(
+        int(rel.get("positive_count", 0)),
+        int(rel.get("negative_count", 0)),
+        int(rel.get("neutral_count", 0)),
+    )
+    stats = (rel.get("dataset_stats") or {}).get(dataset, {}) if dataset else {}
+    dataset_score = _success_score(
+        int(stats.get("positive_count", 0)),
+        int(stats.get("negative_count", 0)),
+        int(stats.get("neutral_count", 0)),
+    )
+    return _clip01(dataset_weight * dataset_score + global_weight * global_score)
+
+
+def _relation_recent_failure_streak(rel: dict[str, Any], dataset: str = "") -> int:
+    streak = 0
+    evidence_rows = rel.get("evidence") or []
+    for item in reversed(evidence_rows):
+        if dataset and str(item.get("dataset") or "").upper() != dataset:
+            continue
+        if item.get("direction") == "decrease":
+            streak += 1
+            continue
+        if item.get("direction") in {"increase", "neutral"}:
+            break
+    return streak
 
 
 def _softmax(values: list[float], temperature: float) -> list[float]:
@@ -283,7 +329,7 @@ def _recent_execution_risk(memory: dict[str, Any], window: int = 3) -> float:
         evidence_rows.extend(rel.get("evidence") or [])
     evidence_rows = sorted(evidence_rows, key=lambda row: str(row.get("ts") or ""))[-window:]
     for row in evidence_rows:
-        if row.get("evidence_policy") == "off_policy":
+        if str(row.get("evidence_policy", "")).startswith("off_policy"):
             risk += 0.35
         if row.get("candidate_status") == "off_policy_mismatch_not_rewarded":
             risk += 0.35
@@ -297,21 +343,62 @@ def _attention_config(selection: dict[str, Any]) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
+def _stagnation_rounds(feedback: dict[str, Any], state: dict[str, Any] | None, threshold: float) -> int:
+    features = feedback.get("features") or {}
+    explicit = features.get("stagnation_rounds", feedback.get("stagnation_rounds"))
+    if explicit is not None:
+        return max(0, int(_safe_float(explicit)))
+
+    current = _safe_float(feedback.get("current_target"), None)
+    best = _safe_float(feedback.get("best_target"), None)
+    stagnant_now = False
+    if current is not None and best is not None:
+        stagnant_now = current >= best * (1.0 - threshold)
+    elif _safe_float(features.get("improved_vs_best")) <= 0.0 and feedback.get("previous_target") is not None:
+        stagnant_now = True
+
+    if not stagnant_now:
+        return 0
+
+    rounds = 1
+    iterations = (state or {}).get("iterations") or {}
+    target_metric = str(feedback.get("target_metric") or "mae_inverse")
+    history: list[tuple[int, float]] = []
+    for key, record in iterations.items():
+        try:
+            iteration = int(str(key).split("_")[-1])
+        except Exception:
+            iteration = int(record.get("iteration", 0))
+        result = record.get("result") or {}
+        value = (result.get("metrics") or {}).get("target", {}).get(target_metric)
+        if value is not None:
+            history.append((iteration, _safe_float(value)))
+    if len(history) <= 1:
+        return rounds
+    best_seen = min(value for _, value in history)
+    for _, value in sorted(history, reverse=True):
+        if value >= best_seen * (1.0 - threshold):
+            rounds += 1
+        else:
+            break
+    return rounds
+
+
 def _candidate_attention_score(row: dict[str, Any], weights: dict[str, Any]) -> float:
-    probe_match = _safe_float(row.get("severity")) * _safe_float(row.get("confidence"), 1.0)
     expected = _safe_float(row.get("expected_correction"))
     uncertainty = _safe_float(row.get("uncertainty"))
     suppression = row.get("suppression") or {}
     negative = _safe_float(suppression.get("total_penalty"))
     risk = _safe_float(row.get("risk_score"))
+    recent_failure = min(1.0, _safe_float(row.get("recent_failure_streak")) / 2.0)
     score = (
-        float(weights.get("trust", 0.45)) * _safe_float(row.get("operator_trust"))
-        + float(weights.get("component_trust", 0.15)) * _safe_float(row.get("component_trust"))
-        + float(weights.get("probe_match", 0.25)) * probe_match
-        + float(weights.get("expected_correction", 0.20)) * expected
-        + float(weights.get("uncertainty", 0.08)) * uncertainty
-        - float(weights.get("negative_memory", 0.35)) * negative
-        - float(weights.get("risk", 0.20)) * risk
+        float(weights.get("expected_correction", 2.0)) * expected
+        + float(weights.get("trust_score", weights.get("trust", 1.5))) * _safe_float(row.get("operator_trust"))
+        + float(weights.get("dataset_specific_success", 1.0)) * _safe_float(row.get("dataset_specific_success"))
+        + float(weights.get("uncertainty", 0.2)) * uncertainty
+        - float(weights.get("negative_memory", 2.0)) * negative
+        - float(weights.get("recent_failure_streak", 2.0)) * recent_failure
+        - float(weights.get("patch_risk", weights.get("risk", 1.5))) * risk
     )
     return score
 
@@ -323,24 +410,19 @@ def _adaptive_temperature(
     config: dict[str, Any],
     dataset: str,
 ) -> dict[str, Any]:
-    base = float(config.get("base_temperature", 0.30))
+    base = float(config.get("base_temperature", 0.25))
     min_tau = float(config.get("min_temperature", 0.10))
-    max_tau = float(config.get("max_temperature", 0.60))
+    max_tau = float(config.get("max_temperature", 0.40))
     adapt = config.get("adapt", {})
     if not isinstance(adapt, dict):
         adapt = {}
     tau = base
     factors: dict[str, float | int | bool] = {}
 
-    current = _safe_float(feedback.get("current_target"), None)
-    best = _safe_float(feedback.get("best_target"), None)
     stagnation_threshold = float(adapt.get("stagnation_threshold", 0.002))
-    stagnant = False
-    if current is not None and best is not None:
-        stagnant = current >= best * (1.0 - stagnation_threshold)
-    elif _safe_float(feedback.get("features", {}).get("improved_vs_best")) <= 0.0 and feedback.get("previous_target") is not None:
-        stagnant = True
-    if stagnant:
+    stagnation_rounds = _stagnation_rounds(feedback, state, stagnation_threshold)
+    factors["stagnation_rounds"] = stagnation_rounds
+    if stagnation_rounds > 0:
         bonus = float(adapt.get("stagnation_bonus", 0.08))
         tau += bonus
         factors["stagnation_bonus"] = bonus
@@ -359,7 +441,7 @@ def _adaptive_temperature(
     raw_weights = _softmax(raw_scores, base) if raw_scores else []
     entropy = _normalized_entropy(raw_weights)
     factors["candidate_entropy"] = round(entropy, 6)
-    if raw_scores and entropy < float(adapt.get("entropy_low_threshold", 0.45)):
+    if raw_scores and entropy < float(adapt.get("entropy_low_threshold", 0.30)):
         bonus = float(adapt.get("entropy_collapse_bonus", 0.05))
         tau += bonus
         factors["entropy_collapse_bonus"] = bonus
@@ -402,6 +484,8 @@ def _apply_relation_attention(
             "temperature": None,
             "selected_by": "score_argmax",
             "weights_entropy": None,
+            "sampling_allowed": False,
+            "route_status": "attention_disabled",
         }
     weights = config.get("weights", {})
     if not isinstance(weights, dict):
@@ -411,17 +495,104 @@ def _apply_relation_attention(
         row["attention_score"] = round(score, 6)
     meta = _adaptive_temperature(feedback, state, candidate_rows, config, dataset)
     selectable = [row for row in candidate_rows if not row.get("blocked")]
-    attention_weights = _softmax([float(row.get("attention_score", 0.0)) for row in selectable], meta["temperature"])
-    for row, weight in zip(selectable, attention_weights):
+    selectable = sorted(selectable, key=lambda row: float(row.get("attention_score", 0.0)), reverse=True)
+    scores = [float(row.get("attention_score", 0.0)) for row in selectable]
+    top1_score = scores[0] if scores else 0.0
+    top2_score = scores[1] if len(scores) > 1 else top1_score
+    margin = top1_score - top2_score if len(scores) > 1 else float("inf")
+    initial_weights = _softmax(scores, meta["temperature"])
+    initial_entropy = _normalized_entropy(initial_weights)
+
+    entropy_cfg = config.get("entropy_gate", {})
+    if not isinstance(entropy_cfg, dict):
+        entropy_cfg = {}
+    margin_cfg = config.get("margin_gate", {})
+    if not isinstance(margin_cfg, dict):
+        margin_cfg = {}
+    sampling_cfg = config.get("sampling_policy", {})
+    if not isinstance(sampling_cfg, dict):
+        sampling_cfg = {}
+
+    high_entropy_threshold = float(entropy_cfg.get("high_entropy_threshold", 0.90))
+    max_entropy_for_sampling = float(entropy_cfg.get("max_entropy_for_sampling", 0.85))
+    min_margin = float(margin_cfg.get("min_top1_top2_margin", 0.08))
+    temperature = float(meta["temperature"])
+    gates: list[str] = []
+    route_status = "observable"
+    observability_status = "observable"
+
+    if initial_entropy > high_entropy_threshold:
+        gates.append("high_entropy")
+        route_status = "low_observability"
+        observability_status = "high_entropy_low_observability"
+        temperature = max(float(meta["min_temperature"]), min(temperature, float(meta["base_temperature"]) - 0.05))
+
+    if len(scores) > 1 and margin < min_margin:
+        gates.append("low_margin")
+        route_status = "low_observability"
+        observability_status = "low_margin_low_observability" if observability_status == "observable" else observability_status
+
+    attention_weights = _softmax(scores, temperature)
+    entropy = _normalized_entropy(attention_weights)
+    for rank, (row, weight) in enumerate(zip(selectable, attention_weights), start=1):
         row["attention_weight"] = round(weight, 8)
-        row["relation_temperature"] = meta["temperature"]
+        row["relation_temperature"] = round(temperature, 6)
+        row["attention_rank"] = rank
     for row in candidate_rows:
         row.setdefault("attention_weight", 0.0)
-        row.setdefault("relation_temperature", meta["temperature"])
-    meta["weights_entropy"] = round(_normalized_entropy(attention_weights), 6)
-    meta["sample_top_k"] = int(config.get("sample_top_k", 4))
+        row.setdefault("relation_temperature", round(temperature, 6))
+    sample_top_k = max(1, int(config.get("sample_top_k", 2)))
+    sampling_pool = selectable[:sample_top_k]
+    if bool(sampling_cfg.get("require_no_cooldown", True)):
+        sampling_pool = [row for row in sampling_pool if int(row.get("cooldown_remaining", 0)) <= 0]
+    if bool(sampling_cfg.get("require_low_risk", True)):
+        max_risk = float(sampling_cfg.get("max_low_risk_score", 0.35))
+        sampling_pool = [row for row in sampling_pool if float(row.get("risk_score", 1.0)) <= max_risk]
+
+    stagnation_required = int(sampling_cfg.get("enable_only_if_stagnation_rounds", 3))
+    stagnation_rounds = int((meta.get("factors") or {}).get("stagnation_rounds", 0))
+    top_recent_failure = bool(selectable and int(selectable[0].get("recent_failure_streak", 0)) > 0)
+    strict_sampling_allowed = (
+        len(sampling_pool) >= 2
+        and stagnation_rounds >= stagnation_required
+        and entropy < max_entropy_for_sampling
+        and (len(scores) <= 1 or margin >= min_margin)
+        and (
+            top_recent_failure
+            or not bool(sampling_cfg.get("require_top_relation_recent_failure", True))
+        )
+    )
+    sampling_allowed = bool(config.get("enable_sampling_by_default", False)) or strict_sampling_allowed
+    if route_status != "observable":
+        sampling_allowed = False
+    default_selection = str(config.get("default_selection", "top1"))
+    if default_selection == "top1" and not strict_sampling_allowed:
+        sampling_allowed = False
+    if not sampling_allowed:
+        sampling_reason = "top1_conservative"
+    elif strict_sampling_allowed:
+        sampling_reason = "strict_low_risk_stagnation_sampling"
+    else:
+        sampling_reason = "enabled_by_policy"
+
+    meta["temperature"] = round(temperature, 6)
+    meta["weights_entropy"] = round(entropy, 6)
+    meta["pre_gate_entropy"] = round(initial_entropy, 6)
+    meta["top1_top2_margin"] = None if math.isinf(margin) else round(margin, 6)
+    meta["sample_top_k"] = sample_top_k
     meta["sampling"] = str(config.get("sampling", "deterministic"))
-    meta["selected_by"] = "trust_calibrated_attention"
+    meta["sampling_allowed"] = sampling_allowed
+    meta["sampling_reason"] = sampling_reason
+    meta["default_selection"] = default_selection
+    meta["route_status"] = route_status
+    meta["observability_status"] = observability_status
+    meta["gates"] = gates
+    meta["max_entropy_for_sampling"] = max_entropy_for_sampling
+    meta["high_entropy_threshold"] = high_entropy_threshold
+    meta["min_top1_top2_margin"] = min_margin
+    meta["top_relation_recent_failure"] = top_recent_failure
+    meta["eligible_sampling_relation_ids"] = [str(row.get("relation_id")) for row in sampling_pool]
+    meta["selected_by"] = "trust_attention_sampling" if sampling_allowed else "attention_top1_conservative"
     return meta
 
 
@@ -437,9 +608,14 @@ def _select_attention_candidate(
         return selectable[0], False
     sample_top_k = max(1, int(attention_meta.get("sample_top_k", 4)))
     pool = sorted(selectable, key=lambda row: row.get("attention_weight", 0.0), reverse=True)[:sample_top_k]
-    if float(attention_meta.get("temperature") or 0.0) <= float(attention_meta.get("base_temperature") or 0.0) + 1e-8:
+    if not bool(attention_meta.get("sampling_allowed", False)):
         return pool[0], False
-    if str(attention_meta.get("sampling", "deterministic")) != "deterministic" or len(pool) == 1:
+    eligible = set(attention_meta.get("eligible_sampling_relation_ids") or [])
+    if eligible:
+        filtered_pool = [row for row in pool if str(row.get("relation_id")) in eligible]
+        if filtered_pool:
+            pool = filtered_pool
+    if str(attention_meta.get("sampling", "deterministic")) != "deterministic" or len(pool) <= 1:
         return pool[0], False
     weights = [float(row.get("attention_weight", 0.0)) for row in pool]
     total = sum(weights)
@@ -456,6 +632,131 @@ def _select_attention_candidate(
     return pool[-1], len(pool) > 1
 
 
+def _select_structural_candidate(
+    selected: dict[str, Any] | None,
+    selectable: list[dict[str, Any]],
+    attention_meta: dict[str, Any],
+    selection: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    cfg = selection.get("structural_exploration", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    meta: dict[str, Any] = {
+        "enabled": bool(cfg.get("enabled", False)),
+        "selected": False,
+        "reason": None,
+    }
+    if not selected or not selectable or not meta["enabled"]:
+        return selected, meta
+
+    def local_fallback(reason: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        meta["reason"] = reason
+        if str(selected.get("operator_intensity", "local")) != "structural":
+            return selected, meta
+        local_rows = [row for row in selectable if str(row.get("operator_intensity", "local")) != "structural"]
+        if not local_rows:
+            return selected, meta
+        local = dict(local_rows[0])
+        local.setdefault("edit_intensity", str(local.get("operator_intensity", "local")))
+        local.setdefault("credit_scope", "single_relation_local_patch")
+        meta["replaced_blocked_structural_relation_id"] = selected.get("relation_id")
+        meta["fallback_relation_id"] = local.get("relation_id")
+        return local, meta
+
+    stagnation_rounds = int((attention_meta.get("factors") or {}).get("stagnation_rounds", 0))
+    required_stagnation = int(cfg.get("enable_after_stagnation_rounds", 2))
+    route_status = str(attention_meta.get("route_status") or "observable")
+    if route_status != "observable" and not bool(cfg.get("allow_low_observability", False)):
+        return local_fallback("blocked_low_observability")
+
+    repeated_window = int(cfg.get("repeated_relation_window", 3))
+    recent_relations = _recent_route_relation_ids(state, repeated_window)
+    repeated_top = bool(
+        recent_relations
+        and len(recent_relations) >= repeated_window
+        and len(set(recent_relations)) == 1
+        and recent_relations[-1] == selected.get("relation_id")
+    )
+    top_failed = int(selected.get("recent_failure_streak", 0)) > 0
+    stagnant = stagnation_rounds >= required_stagnation
+    trigger = stagnant or (
+        bool(cfg.get("prefer_when_top_relation_failed", True)) and top_failed
+    ) or (
+        bool(cfg.get("prefer_when_repeated_top_relation", True)) and repeated_top
+    )
+    meta.update(
+        {
+            "stagnation_rounds": stagnation_rounds,
+            "required_stagnation_rounds": required_stagnation,
+            "top_relation_recent_failure": top_failed,
+            "repeated_top_relation": repeated_top,
+        }
+    )
+    if not trigger:
+        return local_fallback("no_escalation_trigger")
+
+    if str(selected.get("operator_intensity", "local")) == "structural":
+        selected = dict(selected)
+        selected["structural_exploration_selected"] = True
+        selected["structural_exploration_reason"] = str(cfg.get("reason", "evidence_gated_structural_escape"))
+        selected["edit_intensity"] = "structural"
+        selected["credit_scope"] = "single_relation_structural_patch"
+        meta.update(
+            {
+                "selected": True,
+                "reason": "attention_top_structural_gate_passed",
+                "selected_relation_id": selected.get("relation_id"),
+                "candidate_count": 1,
+                "replaced_relation_id": None,
+            }
+        )
+        return selected, meta
+
+    min_trust = float(cfg.get("min_operator_trust", 0.45))
+    max_neg = int(cfg.get("max_negative_count", 1))
+    max_dataset_neg = int(cfg.get("max_dataset_negative_count", 1))
+    max_risk = float(cfg.get("max_risk_score", 0.55))
+    structural = [
+        row
+        for row in selectable
+        if str(row.get("operator_intensity", "local")) == "structural"
+        and int(row.get("cooldown_remaining", 0)) <= 0
+        and int(row.get("negative_count", 0)) <= max_neg
+        and int(row.get("dataset_negative_count", 0)) <= max_dataset_neg
+        and float(row.get("operator_trust", 0.0)) >= min_trust
+        and float(row.get("risk_score", 1.0)) <= max_risk
+    ]
+    if not structural:
+        meta["reason"] = "no_safe_structural_candidate"
+        return selected, meta
+
+    structural = sorted(
+        structural,
+        key=lambda row: (
+            float(row.get("attention_score", row.get("score", 0.0))),
+            float(row.get("operator_trust", 0.0)),
+            float(row.get("dataset_specific_success", 0.0)),
+        ),
+        reverse=True,
+    )
+    chosen = dict(structural[0])
+    chosen["structural_exploration_selected"] = True
+    chosen["structural_exploration_reason"] = str(cfg.get("reason", "evidence_gated_structural_escape"))
+    chosen["edit_intensity"] = "structural"
+    chosen["credit_scope"] = "single_relation_structural_patch"
+    meta.update(
+        {
+            "selected": True,
+            "reason": chosen["structural_exploration_reason"],
+            "selected_relation_id": chosen.get("relation_id"),
+            "candidate_count": len(structural),
+            "replaced_relation_id": selected.get("relation_id"),
+        }
+    )
+    return chosen, meta
+
+
 def _negative_memory_rows(
     state: dict[str, Any],
     diagnostics: set[str],
@@ -465,9 +766,16 @@ def _negative_memory_rows(
     relations = ensure_action_memory(state)
     selection = _policy_section("selection")
     cooldown_updates = int(selection.get("cooldown_updates", 2))
-    block_negative_count = int(selection.get("block_negative_count", 4))
+    block_negative_count = int(selection.get("block_negative_count", 3))
     block_dataset_negative_count = int(selection.get("block_dataset_negative_count", 3))
     block_validation_failures = int(selection.get("block_validation_failures", 1))
+    attention = _attention_config(selection)
+    negative_cfg = attention.get("negative_memory", {}) if isinstance(attention, dict) else {}
+    if not isinstance(negative_cfg, dict):
+        negative_cfg = {}
+    block_negative_count = int(negative_cfg.get("block_if_negative_count_ge", block_negative_count))
+    streak_cooldown_threshold = int(negative_cfg.get("cooldown_if_recent_negative_streak", 2))
+    block_requires_no_success = bool(negative_cfg.get("block_if_success_count_eq", 0) == 0)
     memory = state.get("action_memory", {})
     update_count = int(memory.get("update_count", 0))
     rows: list[dict[str, Any]] = []
@@ -475,14 +783,23 @@ def _negative_memory_rows(
         if rel.get("diagnostic") not in diagnostics or rel.get("component") not in components:
             continue
         negative_count = int(rel.get("negative_count", 0))
+        positive_count = int(rel.get("positive_count", 0))
         validation_failures = int(rel.get("validation_failures", 0))
         dataset_stats = (rel.get("dataset_stats") or {}).get(dataset, {}) if dataset else {}
+        dataset_positive_count = int(dataset_stats.get("positive_count", 0))
         dataset_negative_count = int(dataset_stats.get("negative_count", 0))
         last_negative_update = int(dataset_stats.get("last_negative_update", rel.get("last_negative_update", -10**9)))
+        recent_failure_streak = _relation_recent_failure_streak(rel, dataset)
         cooldown_remaining = max(0, cooldown_updates - max(0, update_count - last_negative_update))
+        if recent_failure_streak >= streak_cooldown_threshold:
+            cooldown_remaining = max(cooldown_remaining, 1)
+        global_block = negative_count >= block_negative_count and (not block_requires_no_success or positive_count == 0)
+        dataset_block = dataset_negative_count >= block_dataset_negative_count and (
+            not block_requires_no_success or dataset_positive_count == 0
+        )
         blocked = (
-            negative_count >= block_negative_count
-            or dataset_negative_count >= block_dataset_negative_count
+            global_block
+            or dataset_block
             or validation_failures >= block_validation_failures
         )
         if negative_count <= 0 and validation_failures <= 0 and dataset_negative_count <= 0:
@@ -496,8 +813,11 @@ def _negative_memory_rows(
                 "edit_operator": rel.get("edit_operator"),
                 "trust": round(action_relation_trust(state, rel["diagnostic"], rel["component"], rel["edit_operator"]), 6),
                 "negative_count": negative_count,
+                "positive_count": positive_count,
                 "dataset": dataset,
                 "dataset_negative_count": dataset_negative_count,
+                "dataset_positive_count": dataset_positive_count,
+                "recent_failure_streak": recent_failure_streak,
                 "validation_failures": validation_failures,
                 "cooldown_remaining": cooldown_remaining,
                 "blocked": blocked,
@@ -522,15 +842,19 @@ def select_edit_candidates(
     dataset_negative_penalty = float(selection.get("dataset_negative_penalty", 0.08))
     cooldown_penalty = float(selection.get("cooldown_penalty", 0.20))
     cooldown_updates = int(selection.get("cooldown_updates", 2))
-    block_negative_count = int(selection.get("block_negative_count", 4))
+    block_negative_count = int(selection.get("block_negative_count", 3))
     block_dataset_negative_count = int(selection.get("block_dataset_negative_count", 3))
     block_validation_failures = int(selection.get("block_validation_failures", 1))
     exploration_bonus = float(selection.get("exploration_bonus", 0.02))
-    exploration_cfg = selection.get("controlled_exploration", {})
-    if not isinstance(exploration_cfg, dict):
-        exploration_cfg = {}
-    state = graph_state if graph_state is not None and mode == "trust" else {}
-    if mode == "trust" and graph_state is not None:
+    attention_cfg = _attention_config(selection)
+    negative_cfg = attention_cfg.get("negative_memory", {}) if isinstance(attention_cfg, dict) else {}
+    if not isinstance(negative_cfg, dict):
+        negative_cfg = {}
+    block_negative_count = int(negative_cfg.get("block_if_negative_count_ge", block_negative_count))
+    streak_cooldown_threshold = int(negative_cfg.get("cooldown_if_recent_negative_streak", 2))
+    block_requires_no_success = bool(negative_cfg.get("block_if_success_count_eq", 0) == 0)
+    state = graph_state if graph_state is not None and mode in {"trust", "trust-action"} else {}
+    if mode in {"trust", "trust-action"} and graph_state is not None:
         ensure_action_memory(graph_state)
     context = feedback.get("pemfc_context") or build_pemfc_context(feedback)
     dataset = str(context.get("dataset") or "").upper()
@@ -574,27 +898,38 @@ def select_edit_candidates(
             if rid in seen:
                 continue
             seen.add(rid)
-            if mode == "trust" and graph_state is not None:
+            if mode in {"trust", "trust-action"} and graph_state is not None:
                 op_trust = action_relation_trust(graph_state, diagnostic, component, op_id)
                 rel = ensure_action_memory(graph_state).get(rid, {})
                 n = int(rel.get("n", 0))
                 negative_count = int(rel.get("negative_count", 0))
+                positive_count = int(rel.get("positive_count", 0))
                 validation_failures = int(rel.get("validation_failures", 0))
                 dataset_stats = (rel.get("dataset_stats") or {}).get(dataset, {}) if dataset else {}
+                dataset_positive_count = int(dataset_stats.get("positive_count", 0))
                 dataset_negative_count = int(dataset_stats.get("negative_count", 0))
                 last_negative_update = int(dataset_stats.get("last_negative_update", rel.get("last_negative_update", -10**9)))
             else:
                 op_trust = op_prior
                 n = 0
                 negative_count = 0
+                positive_count = 0
                 validation_failures = 0
+                dataset_positive_count = 0
                 dataset_negative_count = 0
                 last_negative_update = -10**9
                 rel = {}
+            recent_failure_streak = _relation_recent_failure_streak(rel, dataset)
             cooldown_remaining = max(0, cooldown_updates - max(0, update_count - last_negative_update))
+            if recent_failure_streak >= streak_cooldown_threshold:
+                cooldown_remaining = max(cooldown_remaining, 1)
+            global_block = negative_count >= block_negative_count and (not block_requires_no_success or positive_count == 0)
+            dataset_block = dataset_negative_count >= block_dataset_negative_count and (
+                not block_requires_no_success or dataset_positive_count == 0
+            )
             blocked = (
-                negative_count >= block_negative_count
-                or dataset_negative_count >= block_dataset_negative_count
+                global_block
+                or dataset_block
                 or validation_failures >= block_validation_failures
             )
             penalty = (
@@ -605,6 +940,7 @@ def select_edit_candidates(
             exploration = exploration_bonus / float(n + 1)
             uncertainty = 1.0 / math.sqrt(float(n + 1))
             expected_correction = _expected_correction(rel)
+            dataset_specific_success = _dataset_success_score(rel, dataset, attention_cfg)
             risk = _risk_value(str(operator.get("risk", "medium")), rel)
             score = severity * confidence * component_trust * op_trust + exploration - penalty
             candidate_rows.append(
@@ -613,6 +949,7 @@ def select_edit_candidates(
                     "diagnostic": diagnostic,
                     "component": component,
                     "edit_operator": op_id,
+                    "operator_intensity": str(operator.get("intensity", "local")),
                     "score": round(max(0.0, score), 6),
                     "severity": round(severity, 6),
                     "confidence": round(confidence, 6),
@@ -621,12 +958,16 @@ def select_edit_candidates(
                     "operator_prior": round(op_prior, 6),
                     "n": n,
                     "negative_count": negative_count,
+                    "positive_count": positive_count,
                     "dataset": dataset,
                     "dataset_negative_count": dataset_negative_count,
+                    "dataset_positive_count": dataset_positive_count,
+                    "recent_failure_streak": recent_failure_streak,
                     "validation_failures": validation_failures,
                     "cooldown_remaining": cooldown_remaining,
                     "blocked": blocked,
                     "expected_correction": round(expected_correction, 6),
+                    "dataset_specific_success": round(dataset_specific_success, 6),
                     "uncertainty": round(uncertainty, 6),
                     "risk_score": round(risk, 6),
                     "suppression": {
@@ -636,10 +977,14 @@ def select_edit_candidates(
                         "cooldown_penalty": round(cooldown_penalty if cooldown_remaining > 0 else 0.0, 6),
                         "total_penalty": round(penalty, 6),
                         "cooldown_remaining": cooldown_remaining,
+                        "recent_failure_streak": recent_failure_streak,
+                        "global_block": global_block,
+                        "dataset_block": dataset_block,
                         "blocked": blocked,
                     },
                     "exploration_bonus": round(exploration, 6),
                     "risk": str(operator.get("risk", "medium")),
+                    "template": str(operator.get("template", "")),
                     "description": str(operator.get("description", "")),
                     "prompt_guidance": str(operator.get("prompt_guidance", "")),
                     "evidence": prop.get("evidence", {}),
@@ -662,37 +1007,16 @@ def select_edit_candidates(
         if attention_sampled:
             selected["attention_sampled"] = True
             selected["attention_sample_reason"] = "deterministic_softmax_relation_temperature"
-    exploration_selected = False
-    if selected and selectable and bool(exploration_cfg.get("enabled", True)):
-        margin = float(exploration_cfg.get("score_margin", 0.04))
-        min_trust = float(exploration_cfg.get("min_operator_trust", 0.50))
-        max_neg = int(exploration_cfg.get("max_negative_count", 1))
-        prefer_untried = bool(exploration_cfg.get("prefer_untried", True))
-        rank_key = "attention_weight" if attention_meta.get("enabled") else "score"
-        alternatives = [
-            row
-            for row in selectable
-            if row.get("relation_id") != selected.get("relation_id")
-            and float(row.get("operator_trust", 0.0)) >= min_trust
-            and int(row.get("negative_count", 0)) <= max_neg
-            and int(row.get("dataset_negative_count", 0)) <= max_neg
-            and float(row.get(rank_key, 0.0)) >= float(selected.get(rank_key, 0.0)) - margin
-        ]
-        if prefer_untried:
-            alternatives = sorted(
-                alternatives,
-                key=lambda row: (int(row.get("n", 0)) == 0, row.get("score", 0.0), row.get("operator_trust", 0.0)),
-                reverse=True,
-            )
-        if alternatives and (
-            selected.get("suppression", {}).get("total_penalty", 0.0) > 0
-            or int(selected.get("negative_count", 0)) > 0
-            or int(selected.get("dataset_negative_count", 0)) > 0
-        ):
-            selected = dict(alternatives[0])
-            selected["exploration_selected"] = True
-            selected["exploration_reason"] = "near_top_clean_candidate_after_negative_suppression"
-            exploration_selected = True
+    if selected is not None:
+        selected.setdefault("edit_intensity", str(selected.get("operator_intensity", "local")))
+        selected.setdefault("credit_scope", "single_relation_local_patch")
+    selected, structural_meta = _select_structural_candidate(
+        selected,
+        selectable,
+        attention_meta,
+        selection,
+        state,
+    )
     negative_memory: list[dict[str, Any]] = []
     if graph_state is not None:
         negative_memory = _negative_memory_rows(graph_state, set(diagnostics), active, dataset=dataset)
@@ -706,6 +1030,7 @@ def select_edit_candidates(
             "suppression": row.get("suppression"),
             "negative_count": row.get("negative_count"),
             "dataset_negative_count": row.get("dataset_negative_count"),
+            "recent_failure_streak": row.get("recent_failure_streak"),
             "blocked": row.get("blocked"),
         }
         for row in candidate_rows
@@ -717,11 +1042,8 @@ def select_edit_candidates(
         "edit_candidates": candidate_rows[:max_candidates],
         "negative_memory": negative_memory,
         "negative_reuse_suppression": suppression_rows,
-        "controlled_exploration": {
-            "enabled": bool(exploration_cfg.get("enabled", True)),
-            "selected": exploration_selected,
-            "policy": exploration_cfg,
-        },
+        "controlled_exploration": {},
+        "structural_exploration": structural_meta,
         "relation_attention": attention_meta,
         "memory_context": context,
     }
@@ -834,6 +1156,13 @@ def update_action_memory_from_outcome(
     max_update = float(update_policy.get("max_update", 1.0))
     validation_failure_penalty = float(update_policy.get("validation_failure_penalty", 0.35))
     agreement_trust_threshold = float(update_policy.get("agreement_trust_threshold", 0.65))
+    selection_policy = _policy_section("selection")
+    mismatch_cfg = _attention_config(selection_policy).get("mismatch_update", {})
+    if not isinstance(mismatch_cfg, dict):
+        mismatch_cfg = {}
+    reward_selected_on_mismatch = bool(mismatch_cfg.get("reward_selected_relation", False))
+    update_actual_off_policy = bool(mismatch_cfg.get("update_actual_relation_as_off_policy", True))
+    off_policy_weight = _clip01(float(mismatch_cfg.get("off_policy_weight", 0.3)))
 
     rel = relations[rid]
     trust_before = action_relation_trust(state, diagnostic, component, edit_operator)
@@ -854,6 +1183,7 @@ def update_action_memory_from_outcome(
     operator_mismatch = bool(patch_record.get("edit_operator_mismatch", False))
     component_mismatch = bool(patch_record.get("component_mismatch", False))
     on_policy = not operator_mismatch and not component_mismatch
+    selected_scored = on_policy or reward_selected_on_mismatch
 
     if patch_record.get("validation_fallback"):
         raw_reward = -abs(validation_failure_penalty)
@@ -870,7 +1200,7 @@ def update_action_memory_from_outcome(
         reason = "probe_aligned_target_delta"
     raw_reward = _clip(raw_reward)
 
-    if not on_policy:
+    if not selected_scored:
         reward = 0.0
         update_amount = 0.0
         direction = "off_policy"
@@ -879,28 +1209,28 @@ def update_action_memory_from_outcome(
     else:
         reward = raw_reward
         update_amount = min(max_update, max(0.04, abs(reward) * update_scale))
-    if on_policy and reward > positive_threshold:
+    if selected_scored and reward > positive_threshold:
         rel["alpha"] = _safe_float(rel.get("alpha"), 1.0) + update_amount
         rel["positive_count"] = int(rel.get("positive_count", 0)) + 1
         direction = "increase"
         candidate_status = "accepted_by_probe_reward"
-    elif on_policy and reward < negative_threshold:
+    elif selected_scored and reward < negative_threshold:
         rel["beta"] = _safe_float(rel.get("beta"), 1.0) + update_amount
         rel["negative_count"] = int(rel.get("negative_count", 0)) + 1
         rel["last_negative_update"] = update_index
         direction = "decrease"
         candidate_status = "rejected_by_probe_reward"
-    elif on_policy:
+    elif selected_scored:
         rel["alpha"] = _safe_float(rel.get("alpha"), 1.0) + 0.02
         rel["beta"] = _safe_float(rel.get("beta"), 1.0) + 0.02
         direction = "neutral"
         candidate_status = "ambiguous_probe_reward"
-    if on_policy and patch_record.get("validation_fallback"):
+    if selected_scored and patch_record.get("validation_fallback"):
         rel["validation_failures"] = int(rel.get("validation_failures", 0)) + 1
 
-    if on_policy:
+    if selected_scored:
         rel["n"] = int(rel.get("n", 0)) + 1
-    if dataset and on_policy:
+    if dataset and selected_scored:
         stats = rel.setdefault("dataset_stats", {}).setdefault(
             dataset,
             {"positive_count": 0, "negative_count": 0, "neutral_count": 0, "validation_failures": 0},
@@ -924,7 +1254,7 @@ def update_action_memory_from_outcome(
         "diagnostic": diagnostic,
         "component": component,
         "edit_operator": edit_operator,
-        "evidence_policy": "on_policy" if on_policy else "off_policy",
+        "evidence_policy": "on_policy" if on_policy else ("off_policy_rewarded" if selected_scored else "off_policy"),
         "trust_before": round(trust_before, 6),
         "trust_after": round(rel["trust"], 6),
         "direction": direction,
@@ -951,6 +1281,106 @@ def update_action_memory_from_outcome(
     rel.setdefault("evidence", []).append(evidence)
     if direction == "decrease":
         _append_negative_experience(memory, evidence)
+    updates = [evidence]
+
+    obedience = memory.setdefault("patcher_obedience", {"attempts": 0, "mismatch_count": 0})
+    obedience["attempts"] = int(obedience.get("attempts", 0)) + 1
+    if not on_policy:
+        obedience["mismatch_count"] = int(obedience.get("mismatch_count", 0)) + 1
+        obedience["last_mismatch_update"] = update_index
+        obedience["last_selected_relation_id"] = rid
+
+    if not on_policy and update_actual_off_policy:
+        actual_component = str(patch_record.get("component") or patch_record.get("routed_component") or "")
+        actual_operator = str(
+            patch_record.get("edit_action")
+            or patch_record.get("edit_operator")
+            or patch_record.get("edit_operator_id")
+            or ""
+        )
+        actual_rid = action_relation_id(diagnostic, actual_component, actual_operator)
+        if actual_component and actual_operator and actual_rid in relations and actual_rid != rid:
+            actual_rel = relations[actual_rid]
+            actual_trust_before = action_relation_trust(state, diagnostic, actual_component, actual_operator)
+            actual_reward = _clip(raw_reward * off_policy_weight)
+            actual_update_amount = min(max_update, max(0.02, abs(actual_reward) * update_scale))
+            actual_rel["off_policy_count"] = int(actual_rel.get("off_policy_count", 0)) + 1
+            if actual_reward > positive_threshold:
+                actual_rel["alpha"] = _safe_float(actual_rel.get("alpha"), 1.0) + actual_update_amount
+                actual_rel["off_policy_positive_count"] = int(actual_rel.get("off_policy_positive_count", 0)) + 1
+                actual_direction = "increase"
+                actual_status = "off_policy_actual_improved"
+            elif actual_reward < negative_threshold:
+                actual_rel["beta"] = _safe_float(actual_rel.get("beta"), 1.0) + actual_update_amount
+                actual_rel["off_policy_negative_count"] = int(actual_rel.get("off_policy_negative_count", 0)) + 1
+                actual_rel["last_negative_update"] = update_index
+                actual_direction = "decrease"
+                actual_status = "off_policy_actual_degraded"
+            else:
+                actual_rel["alpha"] = _safe_float(actual_rel.get("alpha"), 1.0) + 0.01
+                actual_rel["beta"] = _safe_float(actual_rel.get("beta"), 1.0) + 0.01
+                actual_rel["off_policy_neutral_count"] = int(actual_rel.get("off_policy_neutral_count", 0)) + 1
+                actual_direction = "neutral"
+                actual_status = "off_policy_actual_ambiguous"
+            if dataset:
+                actual_stats = actual_rel.setdefault("dataset_stats", {}).setdefault(
+                    dataset,
+                    {
+                        "positive_count": 0,
+                        "negative_count": 0,
+                        "neutral_count": 0,
+                        "validation_failures": 0,
+                    },
+                )
+                key = {
+                    "increase": "off_policy_positive_count",
+                    "decrease": "off_policy_negative_count",
+                    "neutral": "off_policy_neutral_count",
+                }[actual_direction]
+                actual_stats[key] = int(actual_stats.get(key, 0)) + 1
+                if actual_direction == "decrease":
+                    actual_stats["last_negative_update"] = update_index
+            actual_rel["trust"] = action_relation_trust(state, diagnostic, actual_component, actual_operator)
+            actual_rel["updated_at"] = _now()
+            actual_agreement = _trust_outcome_agreement(actual_trust_before, actual_direction, agreement_trust_threshold)
+            actual_agreement["policy"] = "off_policy_actual"
+            actual_evidence = {
+                "ts": _now(),
+                "relation_id": actual_rid,
+                "dataset": dataset,
+                "diagnostic": diagnostic,
+                "component": actual_component,
+                "edit_operator": actual_operator,
+                "evidence_policy": "off_policy_actual",
+                "trust_before": round(actual_trust_before, 6),
+                "trust_after": round(actual_rel["trust"], 6),
+                "direction": actual_direction,
+                "candidate_status": actual_status,
+                "update_amount": round(actual_update_amount, 6),
+                "off_policy_weight": off_policy_weight,
+                "reward": {
+                    "reward": round(actual_reward, 6),
+                    "raw_reward": round(raw_reward, 6),
+                    "reason": reason,
+                    "target_delta": target_delta,
+                    "diagnostic_delta": diagnostic_delta,
+                    "previous_probe": previous_probe,
+                    "next_probe": next_probe,
+                    "overfit_delta": overfit_delta,
+                },
+                "trust_outcome_agreement": actual_agreement,
+                "previous_target": previous_target,
+                "next_target": next_target,
+                "previous_result_path": previous_result.get("paths", {}).get("result"),
+                "next_result_path": next_result.get("paths", {}).get("result"),
+                "operator_mismatch": operator_mismatch,
+                "component_mismatch": component_mismatch,
+                "source_selected_relation_id": rid,
+            }
+            actual_rel.setdefault("evidence", []).append(actual_evidence)
+            if actual_direction == "decrease":
+                _append_negative_experience(memory, actual_evidence)
+            updates.append(actual_evidence)
     memory["update_count"] = update_index
     memory["updated_at"] = _now()
-    return [evidence]
+    return updates

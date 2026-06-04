@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from .config import save_json
 from .data import load_pemfc_data
-from .harness_spec import get_default_dataset_name, get_enc_in
+from .harness_spec import get_dataset_metric_scales, get_default_dataset_name, get_enc_in
 from .metrics import metric_dict
 from .model_io import instantiate_model
 
@@ -132,6 +132,21 @@ def _categorize_exception(exc: Exception) -> str:
 def _inverse_scale(data: np.ndarray, scaler_y: Any, enc_in: int) -> np.ndarray:
     original_shape = data.shape
     return scaler_y.inverse_transform(data.reshape(-1, enc_in)).reshape(original_shape)
+
+
+def _paper_scaled_metrics(inverse_metrics: dict[str, float], data_name: str) -> dict[str, Any]:
+    scales = get_dataset_metric_scales(data_name)
+    mae_scale = float(scales.get("mae", 1.0))
+    mse_scale = float(scales.get("mse", 1.0))
+    return {
+        "mae": float(inverse_metrics.get("mae", 0.0)) * mae_scale,
+        "mse": float(inverse_metrics.get("mse", 0.0)) * mse_scale,
+        "scales": {
+            "mae": mae_scale,
+            "mse": mse_scale,
+        },
+        "note": "Paper table display scale applied to inverse-voltage metrics.",
+    }
 
 
 def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig) -> dict[str, Any]:
@@ -330,6 +345,7 @@ def run_harness(model_path: str | Path, run_dir: str | Path, cfg: HarnessConfig)
                 "final_val_loss": float(train_curve[-1]["val_loss"]) if train_curve else None,
             },
         }
+        metrics["paper_scaled"] = _paper_scaled_metrics(metrics["inverse"], pemfc.data_name)
         metrics["target"] = {
             "mae_inverse": metrics["inverse"]["mae"],
             "rmse_inverse": metrics["inverse"]["rmse"],

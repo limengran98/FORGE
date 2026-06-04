@@ -258,6 +258,7 @@ class GraphOrchestrator:
             "negative_memory": route.get("negative_memory") or [],
             "negative_reuse_suppression": route.get("negative_reuse_suppression") or [],
             "controlled_exploration": route.get("controlled_exploration") or {},
+            "structural_exploration": route.get("structural_exploration") or {},
             "relation_attention": route.get("relation_attention") or {},
             "memory_context": route.get("memory_context") or {},
         }
@@ -333,6 +334,9 @@ class GraphOrchestrator:
             "output_model_path": patch_meta.get("output_model_path"),
             "diff_path": patch_meta.get("diff_path"),
             "parent_model_path": patch_meta.get("parent_model_path"),
+            "parent_iteration": patch_meta.get("parent_iteration"),
+            "parent_target": patch_meta.get("parent_target"),
+            "parent_result_path": patch_meta.get("parent_result_path"),
             "routed_component": patch_meta.get("routed_component"),
             "route_propagations": patch_meta.get("route_propagations") or [],
             "trust_before": patch_meta.get("trust_before") or {},
@@ -341,10 +345,12 @@ class GraphOrchestrator:
             "negative_memory": patch_meta.get("negative_memory") or [],
             "negative_reuse_suppression": patch_meta.get("negative_reuse_suppression") or [],
             "controlled_exploration": patch_meta.get("controlled_exploration") or {},
+            "structural_exploration": patch_meta.get("structural_exploration") or {},
             "relation_attention": patch_meta.get("relation_attention") or {},
             "memory_context": patch_meta.get("memory_context") or {},
             "edit_action": patch_meta.get("edit_action"),
             "edit_operator_mismatch": bool(patch_meta.get("edit_operator_mismatch", False)),
+            "component_mismatch": bool(patch_meta.get("component_mismatch", False)),
             "repair_attempts": patch_meta.get("repair_attempts") or [],
             "validation_fallback": bool(patch_meta.get("validation_fallback", False)),
         }
@@ -363,6 +369,7 @@ class GraphOrchestrator:
         previous_feedback: dict[str, Any],
         next_feedback: dict[str, Any],
         target_metric: str,
+        update_action_memory: bool = False,
     ) -> list[dict[str, Any]]:
         patch_record = self._iteration_record(patch_iteration).get("patch", {})
         if not patch_record:
@@ -400,39 +407,40 @@ class GraphOrchestrator:
                 },
             )
 
-        existing_action = outcome_record.get("action_memory_updates", [])
-        if existing_action:
-            action_updates = list(existing_action)
-        else:
-            action_updates = update_action_memory_from_outcome(
-                self.state,
-                patch_record,
-                previous_result,
-                next_result,
-                previous_feedback,
-                next_feedback,
-                target_metric,
-            )
-            outcome_record["action_memory_updates"] = action_updates
-            self.event(
-                "action_memory_updated",
-                {
-                    "patch_iteration": patch_iteration,
-                    "outcome_iteration": outcome_iteration,
-                    "updates": [
-                        {
-                            "diagnostic": item.get("diagnostic"),
-                            "component": item.get("component"),
-                            "edit_operator": item.get("edit_operator"),
-                            "trust_before": item.get("trust_before"),
-                            "trust_after": item.get("trust_after"),
-                            "direction": item.get("direction"),
-                            "candidate_status": item.get("candidate_status"),
-                        }
-                        for item in action_updates
-                    ],
-                },
-            )
+        if update_action_memory:
+            existing_action = outcome_record.get("action_memory_updates", [])
+            if existing_action:
+                action_updates = list(existing_action)
+            else:
+                action_updates = update_action_memory_from_outcome(
+                    self.state,
+                    patch_record,
+                    previous_result,
+                    next_result,
+                    previous_feedback,
+                    next_feedback,
+                    target_metric,
+                )
+                outcome_record["action_memory_updates"] = action_updates
+                self.event(
+                    "action_memory_updated",
+                    {
+                        "patch_iteration": patch_iteration,
+                        "outcome_iteration": outcome_iteration,
+                        "updates": [
+                            {
+                                "diagnostic": item.get("diagnostic"),
+                                "component": item.get("component"),
+                                "edit_operator": item.get("edit_operator"),
+                                "trust_before": item.get("trust_before"),
+                                "trust_after": item.get("trust_after"),
+                                "direction": item.get("direction"),
+                                "candidate_status": item.get("candidate_status"),
+                            }
+                            for item in action_updates
+                        ],
+                    },
+                )
         outcome_record["updated_at"] = _now()
         self.save()
         return updates

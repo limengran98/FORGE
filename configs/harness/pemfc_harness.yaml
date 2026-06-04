@@ -9,9 +9,15 @@ datasets:
   FC1:
     filename: FC1_Without_Ripples_Excel.csv
     description: PEMFC run without ripples.
+    paper_metric_scale:
+      mae: 10000
+      mse: 10000000
   FC2:
     filename: FC2_With_Ripples_Excel.csv
     description: PEMFC run with ripples.
+    paper_metric_scale:
+      mae: 100
+      mse: 1000
 
 features:
   voltage_inputs:

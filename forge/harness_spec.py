@@ -71,6 +71,20 @@ def get_dataset_files() -> dict[str, str]:
     return out
 
 
+def get_dataset_metric_scales(data_name: str) -> dict[str, float]:
+    datasets = load_pemfc_harness_spec().get("datasets", {})
+    info = datasets.get(str(data_name).upper(), {})
+    if not isinstance(info, dict):
+        return {"mae": 1.0, "mse": 1.0}
+    raw_scales = info.get("paper_metric_scale", {})
+    if not isinstance(raw_scales, dict):
+        raw_scales = {}
+    return {
+        "mae": float(raw_scales.get("mae", 1.0)),
+        "mse": float(raw_scales.get("mse", 1.0)),
+    }
+
+
 def get_default_dataset_name() -> str:
     raw_default = load_pemfc_harness_spec().get("default_dataset")
     dataset_files = get_dataset_files()
@@ -210,6 +224,10 @@ def validate_harness_specs() -> None:
     dataset_files = get_dataset_files()
     if get_default_dataset_name() not in dataset_files:
         raise ValueError("Default dataset must exist in datasets")
+    for name in dataset_files:
+        scales = get_dataset_metric_scales(name)
+        if scales["mae"] <= 0 or scales["mse"] <= 0:
+            raise ValueError(f"Dataset {name} paper_metric_scale values must be positive")
 
     features = get_feature_groups()
     interface = load_pemfc_harness_spec().get("model_interface", {})
@@ -278,6 +296,9 @@ def validate_harness_specs() -> None:
             value = float(prior)
             if not (0.0 < value < 1.0):
                 raise ValueError(f"Edit operator prior for {op_id!r}/{diagnostic!r} must be in (0, 1)")
+        template = operator.get("template")
+        if template and not resolve_project_path(str(template)).exists():
+            raise ValueError(f"Edit operator {op_id!r} template does not exist: {template}")
 
     get_component_graph()
     get_iteration_stages()

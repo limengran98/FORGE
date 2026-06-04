@@ -32,7 +32,7 @@ def write_iteration_report(
         "",
     ]
     metrics = result.get("metrics", {})
-    for scope in ("normalized", "inverse"):
+    for scope in ("normalized", "inverse", "paper_scaled"):
         if scope in metrics:
             lines.append(f"### {scope}")
             for key, value in metrics[scope].items():
@@ -88,8 +88,13 @@ def write_iteration_report(
             )
         if selected_edit.get("attention_sampled"):
             lines.append(f"- Attention sample: `{selected_edit.get('attention_sample_reason')}`")
-        if selected_edit.get("exploration_selected"):
-            lines.append(f"- Controlled exploration: `{selected_edit.get('exploration_reason')}`")
+        if selected_edit.get("structural_exploration_selected"):
+            lines.append(f"- Structural exploration: `{selected_edit.get('structural_exploration_reason')}`")
+        if selected_edit.get("edit_intensity"):
+            lines.append(
+                f"- Edit intensity: `{selected_edit.get('edit_intensity')}` "
+                f"credit_scope=`{selected_edit.get('credit_scope')}`"
+            )
         if selected_edit.get("prompt_guidance"):
             lines.append(f"- Guidance: {selected_edit.get('prompt_guidance')}")
         lines.append("")
@@ -100,6 +105,17 @@ def write_iteration_report(
             f"- Enabled: `{bool(attention.get('enabled'))}` temperature=`{attention.get('temperature')}` "
             f"entropy=`{attention.get('weights_entropy')}` selected_by=`{attention.get('selected_by')}`"
         )
+        lines.append(
+            f"- Observability: status=`{attention.get('observability_status')}` "
+            f"route_status=`{attention.get('route_status')}` sampling_allowed=`{bool(attention.get('sampling_allowed'))}` "
+            f"reason=`{attention.get('sampling_reason')}`"
+        )
+        if attention.get("top1_top2_margin") is not None:
+            lines.append(
+                f"- Gates: pre_entropy=`{attention.get('pre_gate_entropy')}` "
+                f"top1_top2_margin=`{attention.get('top1_top2_margin')}` "
+                f"active_gates=`{', '.join(attention.get('gates') or []) or 'none'}`"
+            )
         factors = attention.get("factors") or {}
         if factors:
             factor_text = ", ".join(f"{key}={value}" for key, value in factors.items())
@@ -143,6 +159,15 @@ def write_iteration_report(
         lines.append(f"- Enabled: `{bool(exploration.get('enabled'))}`")
         lines.append(f"- Selected exploration candidate: `{bool(exploration.get('selected'))}`")
         lines.append("")
+    structural = route.get("structural_exploration") or {}
+    if structural:
+        lines.extend(["### Structural Exploration", ""])
+        lines.append(f"- Enabled: `{bool(structural.get('enabled'))}`")
+        lines.append(f"- Selected structural candidate: `{bool(structural.get('selected'))}`")
+        lines.append(f"- Reason: `{structural.get('reason')}`")
+        if structural.get("selected_relation_id"):
+            lines.append(f"- Selected relation: `{structural.get('selected_relation_id')}`")
+        lines.append("")
     if trust_updates:
         lines.extend(["## Trust Updates From Executable Outcome", ""])
         for item in trust_updates:
@@ -176,6 +201,8 @@ def write_iteration_report(
                 f"- Edit action: `{patch_meta.get('edit_action')}`",
                 f"- Summary: {patch_meta.get('summary')}",
                 f"- Parent model: `{patch_meta.get('parent_model_path')}`",
+                f"- Parent iteration: `{patch_meta.get('parent_iteration')}`",
+                f"- Parent target: `{patch_meta.get('parent_target')}`",
                 f"- Diff: `{patch_meta.get('diff_path')}`",
                 f"- Validation fallback: `{bool(patch_meta.get('validation_fallback', False))}`",
                 f"- Edit operator mismatch: `{bool(patch_meta.get('edit_operator_mismatch', False))}`",

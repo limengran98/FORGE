@@ -2,7 +2,8 @@ from argparse import Namespace
 
 import pytest
 
-from forge.cli import _resolve_continue_target, build_parser
+from forge.cli import _parent_baseline_for_patch, _resolve_continue_target, build_parser
+from forge.orchestrator import GraphOrchestrator
 
 
 def test_sweep_parser_accepts_subset_grid():
@@ -64,6 +65,26 @@ def test_continue_parser_accepts_resume_target():
     assert args.cuda_id == 1
 
 
+def test_sweep_parser_accepts_trust_action_ablation_mode():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "sweep",
+            "--datasets",
+            "FC1",
+            "--seq-lens",
+            "24",
+            "--pred-lens",
+            "12",
+            "--llm-mode",
+            "off",
+            "--routing-mode",
+            "trust-action",
+        ]
+    )
+    assert args.routing_mode == "trust-action"
+
+
 def test_continue_target_defaults_to_one_more_round():
     args = Namespace(to_round=None, additional_rounds=None)
     assert _resolve_continue_target(args, last_iteration=1) == 2
@@ -84,3 +105,28 @@ def test_summarize_sweep_parser_accepts_sweep_dir():
     parser = build_parser()
     args = parser.parse_args(["summarize-sweep", "--sweep-dir", "runs/demo_sweep"])
     assert args.sweep_dir == "runs/demo_sweep"
+
+
+def test_parent_baseline_uses_recorded_best_parent(tmp_path):
+    orch = GraphOrchestrator.open(tmp_path)
+    orch.ensure_iteration(1, tmp_path / "iter_001")
+    orch.state["iterations"]["iter_001"]["patch"] = {"parent_iteration": 0}
+    parent_result = {"metrics": {"target": {"mae_inverse": 0.1}}}
+    parent_feedback = {"current_target": 0.1}
+    default_result = {"metrics": {"target": {"mae_inverse": 0.5}}}
+    default_feedback = {"current_target": 0.5}
+    history = [
+        {"iteration": 0, "result": parent_result, "feedback": parent_feedback},
+        {"iteration": 1, "result": default_result, "feedback": default_feedback},
+    ]
+
+    result, feedback = _parent_baseline_for_patch(
+        orch,
+        history,
+        patch_iteration=1,
+        default_result=default_result,
+        default_feedback=default_feedback,
+    )
+
+    assert result is parent_result
+    assert feedback is parent_feedback

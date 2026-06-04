@@ -35,7 +35,7 @@ from .patching import (
 )
 from .paths import CONFIG_DIR, INITIAL_MODEL_PATH, PROJECT_ROOT, RUNS_DIR, ensure_project_dirs
 from .report import write_iteration_report
-from .routing import route_feedback
+from .routing import TRUST_ROUTING_MODES, route_feedback
 
 
 def _timestamp() -> str:
@@ -145,6 +145,15 @@ def _history_route(history: list[dict[str, Any]], iteration: int) -> dict[str, A
     return None
 
 
+def _history_row_by_iteration(history: list[dict[str, Any]], iteration: int | None) -> dict[str, Any] | None:
+    if iteration is None:
+        return None
+    for row in reversed(history):
+        if row.get("iteration") == iteration:
+            return row
+    return None
+
+
 def _attach_saved_feedback_and_routes(orchestrator: GraphOrchestrator, history: list[dict[str, Any]]) -> None:
     for row in history:
         iteration = int(row["iteration"])
@@ -158,24 +167,65 @@ def _attach_saved_feedback_and_routes(orchestrator: GraphOrchestrator, history: 
             pass
 
 
-def _select_parent_model_path(
+def _parent_baseline_for_patch(
+    orchestrator: GraphOrchestrator,
+    history: list[dict[str, Any]],
+    patch_iteration: int,
+    default_result: dict[str, Any],
+    default_feedback: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    patch_record = orchestrator.state.get("iterations", {}).get(f"iter_{patch_iteration:03d}", {}).get("patch", {})
+    parent_iteration = patch_record.get("parent_iteration")
+    try:
+        parent_iteration = int(parent_iteration) if parent_iteration is not None else None
+    except Exception:
+        parent_iteration = None
+    parent_row = _history_row_by_iteration(history, parent_iteration)
+    if not parent_row:
+        return default_result, default_feedback
+    parent_result = parent_row.get("result")
+    parent_feedback = parent_row.get("feedback")
+    if not isinstance(parent_result, dict) or not isinstance(parent_feedback, dict):
+        return default_result, default_feedback
+    return parent_result, parent_feedback
+
+
+def _select_parent_model(
     history: list[dict[str, Any]],
     target_metric: str,
     fallback: Path,
     parent_policy: str,
     run_root: Path,
-) -> Path:
+) -> dict[str, Any]:
+    fallback_info = {
+        "path": fallback,
+        "iteration": history[-1].get("iteration") if history else None,
+        "result": history[-1].get("result") if history else None,
+        "feedback": history[-1].get("feedback") if history else None,
+    }
     if parent_policy != "best":
-        return fallback
-    best = _best_result(history, target_metric)
-    if not best:
-        return fallback
+        return fallback_info
+    success_rows = [row for row in history if row.get("result", {}).get("success")]
+    if not success_rows:
+        return fallback_info
+    best_row = min(
+        success_rows,
+        key=lambda row: row.get("result", {}).get("metrics", {}).get("target", {}).get(target_metric, float("inf")),
+    )
+    best = best_row["result"]
     path = best.get("model_path") or best.get("paths", {}).get("model") or Path(best.get("run_dir", "")) / "model.py"
     try:
         resolved = _resolve_stored_path(path, run_root)
     except Exception:
-        return fallback
-    return resolved if resolved.exists() else fallback
+        return fallback_info
+    if not resolved.exists():
+        return fallback_info
+    return {
+        "path": resolved,
+        "iteration": best_row.get("iteration"),
+        "result": best,
+        "feedback": best_row.get("feedback"),
+    }
 
 
 def _maybe_update_trust_for_iteration(
@@ -183,6 +233,7 @@ def _maybe_update_trust_for_iteration(
     history: list[dict[str, Any]],
     outcome_iteration: int,
     target_metric: str,
+    update_action_memory: bool = False,
 ) -> None:
     if outcome_iteration <= 0:
         return
@@ -194,14 +245,22 @@ def _maybe_update_trust_for_iteration(
     outcome_feedback = outcome_row.get("feedback")
     if not isinstance(previous_feedback, dict) or not isinstance(outcome_feedback, dict):
         return
+    baseline_result, baseline_feedback = _parent_baseline_for_patch(
+        orchestrator,
+        history,
+        outcome_iteration - 1,
+        previous_row["result"],
+        previous_feedback,
+    )
     orchestrator.update_trust_from_outcome(
         outcome_iteration - 1,
         outcome_iteration,
-        previous_row["result"],
+        baseline_result,
         outcome_row["result"],
-        previous_feedback,
+        baseline_feedback,
         outcome_feedback,
         target_metric,
+        update_action_memory=update_action_memory,
     )
 
 
@@ -235,6 +294,7 @@ def _generate_patch_for_next_iteration(
     current_iteration: int,
     next_iteration: int,
     current_model_path: Path,
+    parent_info: dict[str, Any],
     next_dir: Path,
     hcfg: HarnessConfig,
     llm_mode: str,
@@ -379,6 +439,7 @@ def _generate_patch_for_next_iteration(
     patch_meta["negative_memory"] = route.get("negative_memory") or []
     patch_meta["negative_reuse_suppression"] = route.get("negative_reuse_suppression") or []
     patch_meta["controlled_exploration"] = route.get("controlled_exploration") or {}
+    patch_meta["structural_exploration"] = route.get("structural_exploration") or {}
     patch_meta["relation_attention"] = route.get("relation_attention") or {}
     patch_meta["memory_context"] = route.get("memory_context") or feedback.get("pemfc_context") or {}
     patch_meta["edit_operator_mismatch"] = bool(
@@ -390,6 +451,17 @@ def _generate_patch_for_next_iteration(
         and (not actual_component or actual_component != selected_component)
     )
     patch_meta["parent_model_path"] = str(current_model_path)
+    parent_result = parent_info.get("result") if isinstance(parent_info, dict) else None
+    patch_meta["parent_iteration"] = parent_info.get("iteration") if isinstance(parent_info, dict) else None
+    patch_meta["parent_result_path"] = (
+        (parent_result or {}).get("paths", {}).get("result") if isinstance(parent_result, dict) else None
+    )
+    target_metric = str(feedback.get("target_metric") or "mae_inverse")
+    patch_meta["parent_target"] = (
+        (parent_result or {}).get("metrics", {}).get("target", {}).get(target_metric)
+        if isinstance(parent_result, dict)
+        else None
+    )
     save_json(patch_meta, next_dir / "patch_meta.json")
     orchestrator.record_patch(current_iteration, patch_meta)
     return next_model_path, patch_meta
@@ -528,21 +600,29 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             save_json(feedback, feedback_path)
             orchestrator.record_artifact(iteration, "feedback_vector", feedback_path)
 
-        if routing_mode == "trust" and iteration > 0 and previous_result is not None:
+        if routing_mode in TRUST_ROUTING_MODES and iteration > 0 and previous_result is not None:
             previous_feedback = _history_feedback(history, iteration - 1)
             if previous_feedback is not None:
+                baseline_result, baseline_feedback = _parent_baseline_for_patch(
+                    orchestrator,
+                    history,
+                    iteration - 1,
+                    previous_result,
+                    previous_feedback,
+                )
                 orchestrator.update_trust_from_outcome(
                     iteration - 1,
                     iteration,
-                    previous_result,
+                    baseline_result,
                     result,
-                    previous_feedback,
+                    baseline_feedback,
                     feedback,
                     target_metric,
+                    update_action_memory=(routing_mode == "trust-action"),
                 )
 
         with orchestrator.stage(iteration, "route"):
-            route_state = orchestrator.state if routing_mode == "trust" else None
+            route_state = orchestrator.state if routing_mode in TRUST_ROUTING_MODES else None
             route = route_feedback(feedback, route_state, mode=routing_mode)
             route_path = iter_dir / "routing.json"
             save_json(route, route_path)
@@ -555,7 +635,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             next_dir = run_root / f"iter_{iteration + 1:03d}"
             with orchestrator.stage(iteration, "patch", {"next_iteration": iteration + 1}):
                 next_dir.mkdir(parents=True, exist_ok=True)
-                parent_model_path = _select_parent_model_path(
+                parent_info = _select_parent_model(
                     history,
                     target_metric,
                     current_model_path,
@@ -566,7 +646,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                     orchestrator,
                     iteration,
                     iteration + 1,
-                    parent_model_path,
+                    parent_info["path"],
+                    parent_info,
                     next_dir,
                     hcfg,
                     llm_mode,
@@ -673,8 +754,14 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         if current_row is not None:
             current_row["feedback"] = feedback
             current_row["route"] = route
-        if routing_mode == "trust":
-            _maybe_update_trust_for_iteration(orchestrator, history, current_iteration, target_metric)
+        if routing_mode in TRUST_ROUTING_MODES:
+            _maybe_update_trust_for_iteration(
+                orchestrator,
+                history,
+                current_iteration,
+                target_metric,
+                update_action_memory=(routing_mode == "trust-action"),
+            )
 
         next_iteration = current_iteration + 1
         next_dir = run_root / f"iter_{next_iteration:03d}"
@@ -688,7 +775,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
             print(f"[FORGE] Reusing existing patch for iter_{current_iteration:03d} -> iter_{next_iteration:03d}")
         else:
             with orchestrator.stage(current_iteration, "route", {"resume": True, "trust_refresh": True}):
-                route_state = orchestrator.state if routing_mode == "trust" else None
+                route_state = orchestrator.state if routing_mode in TRUST_ROUTING_MODES else None
                 route = route_feedback(feedback, route_state, mode=routing_mode)
                 route_path = run_root / current_key / "routing.json"
                 save_json(route, route_path)
@@ -697,7 +784,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
                 if current_row is not None:
                     current_row["route"] = route
             with orchestrator.stage(current_iteration, "patch", {"next_iteration": next_iteration, "resume": True}):
-                parent_model_path = _select_parent_model_path(
+                parent_info = _select_parent_model(
                     history,
                     target_metric,
                     current_model_path,
@@ -708,7 +795,8 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
                     orchestrator,
                     current_iteration,
                     next_iteration,
-                    parent_model_path,
+                    parent_info["path"],
+                    parent_info,
                     next_dir,
                     hcfg,
                     llm_mode,
@@ -755,19 +843,27 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
             save_json(next_feedback, feedback_path)
             orchestrator.record_artifact(next_iteration, "feedback_vector", feedback_path)
 
-        if routing_mode == "trust":
+        if routing_mode in TRUST_ROUTING_MODES:
+            baseline_result, baseline_feedback = _parent_baseline_for_patch(
+                orchestrator,
+                history,
+                current_iteration,
+                result,
+                feedback,
+            )
             orchestrator.update_trust_from_outcome(
                 current_iteration,
                 next_iteration,
-                result,
+                baseline_result,
                 next_result,
-                feedback,
+                baseline_feedback,
                 next_feedback,
                 target_metric,
+                update_action_memory=(routing_mode == "trust-action"),
             )
 
         with orchestrator.stage(next_iteration, "route", {"resume": True}):
-            route_state = orchestrator.state if routing_mode == "trust" else None
+            route_state = orchestrator.state if routing_mode in TRUST_ROUTING_MODES else None
             next_route = route_feedback(next_feedback, route_state, mode=routing_mode)
             route_path = next_dir / "routing.json"
             save_json(next_route, route_path)
@@ -941,7 +1037,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--rounds", type=int, default=None)
     run_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     run_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
-    run_p.add_argument("--routing-mode", choices=["trust", "prior", "rule"], default="trust")
+    run_p.add_argument("--routing-mode", choices=["trust", "trust-action", "prior", "rule"], default="trust")
     run_p.add_argument("--target-metric", default=None)
     run_p.add_argument("--data", choices=sorted(get_dataset_files()), default=None)
     run_p.add_argument("--data-path", default=None)
@@ -973,7 +1069,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     continue_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     continue_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
-    continue_p.add_argument("--routing-mode", choices=["trust", "prior", "rule"], default="trust")
+    continue_p.add_argument("--routing-mode", choices=["trust", "trust-action", "prior", "rule"], default="trust")
     continue_p.add_argument("--target-metric", default=None)
     continue_p.add_argument("--epochs", type=int, default=None)
     continue_p.add_argument("--batch-size", type=int, default=None)
@@ -991,7 +1087,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument("--rounds", type=int, default=None)
     sweep_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     sweep_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
-    sweep_p.add_argument("--routing-mode", choices=["trust", "prior", "rule"], default="trust")
+    sweep_p.add_argument("--routing-mode", choices=["trust", "trust-action", "prior", "rule"], default="trust")
     sweep_p.add_argument("--target-metric", default=None)
     sweep_p.add_argument("--datasets", nargs="+", choices=sorted(get_dataset_files()), default=None)
     sweep_p.add_argument("--seq-lens", nargs="+", type=int, default=None)

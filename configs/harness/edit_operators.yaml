@@ -11,38 +11,70 @@ selection:
   dataset_negative_penalty: 0.08
   cooldown_penalty: 0.20
   cooldown_updates: 2
-  block_negative_count: 4
+  block_negative_count: 3
   block_dataset_negative_count: 3
   block_validation_failures: 1
-  controlled_exploration:
+  structural_exploration:
     enabled: true
-    score_margin: 0.04
-    min_operator_trust: 0.50
+    enable_after_stagnation_rounds: 2
+    min_operator_trust: 0.45
     max_negative_count: 1
-    prefer_untried: true
+    max_dataset_negative_count: 1
+    max_risk_score: 0.55
+    prefer_when_top_relation_failed: true
+    prefer_when_repeated_top_relation: true
+    repeated_relation_window: 3
+    allow_low_observability: false
+    reason: evidence_gated_structural_escape
   relation_attention:
     enabled: true
-    base_temperature: 0.30
+    default_selection: top1
+    enable_sampling_by_default: false
+    base_temperature: 0.25
     min_temperature: 0.10
-    max_temperature: 0.60
-    sample_top_k: 4
+    max_temperature: 0.40
+    sample_top_k: 2
     sampling: deterministic
+    entropy_gate:
+      max_entropy_for_sampling: 0.85
+      high_entropy_threshold: 0.90
+      action_when_high_entropy: top1_conservative
+    margin_gate:
+      min_top1_top2_margin: 0.08
+      action_when_low_margin: low_observability
+    sampling_policy:
+      enable_only_if_stagnation_rounds: 3
+      require_top_relation_recent_failure: true
+      require_no_cooldown: true
+      require_low_risk: true
+      max_low_risk_score: 0.35
     weights:
-      trust: 0.45
-      component_trust: 0.15
-      probe_match: 0.25
-      expected_correction: 0.20
-      uncertainty: 0.08
-      negative_memory: 0.35
-      risk: 0.20
+      expected_correction: 2.0
+      trust_score: 1.5
+      dataset_specific_success: 1.0
+      uncertainty: 0.2
+      negative_memory: 2.0
+      recent_failure_streak: 2.0
+      patch_risk: 1.5
+    dataset_memory:
+      dataset_specific_weight: 0.7
+      global_weight: 0.3
+    negative_memory:
+      cooldown_if_recent_negative_streak: 2
+      block_if_negative_count_ge: 3
+      block_if_success_count_eq: 0
+    mismatch_update:
+      reward_selected_relation: false
+      update_actual_relation_as_off_policy: true
+      off_policy_weight: 0.3
     adapt:
-      stagnation_bonus: 0.08
-      repeated_relation_bonus: 0.07
-      entropy_collapse_bonus: 0.05
+      stagnation_bonus: 0.05
+      repeated_relation_bonus: 0.04
+      entropy_collapse_bonus: 0.00
       risk_penalty: 0.10
-      negative_streak_penalty: 0.06
+      negative_streak_penalty: 0.08
       stagnation_threshold: 0.002
-      entropy_low_threshold: 0.45
+      entropy_low_threshold: 0.30
       repeated_relation_window: 3
       negative_streak_window: 2
 
@@ -81,6 +113,7 @@ operators:
   - id: add_temporal_smoothing
     component: temporal_memory
     risk: medium
+    intensity: local
     diagnostics:
       residual_autocorrelation: 0.82
       long_horizon_error: 0.78
@@ -89,9 +122,24 @@ operators:
     description: Add a small residual temporal smoother or gated recurrent refinement on top of the existing sequence encoding.
     prompt_guidance: Make a local temporal-memory edit; do not change output shape, factor inputs, or harness API.
 
+  - id: add_multiscale_temporal_context
+    component: temporal_memory
+    risk: medium
+    intensity: structural
+    template: skills/forge_model_templates/multiscale_context_gru.py
+    diagnostics:
+      residual_autocorrelation: 0.86
+      long_horizon_error: 0.84
+      residual_drift: 0.70
+      late_life_error: 0.68
+      dynamic_load_error: 0.42
+    description: Escalate beyond a plain GRU by adding bounded multi-scale temporal convolution, factor-conditioned context, and a residual trend/level forecast path.
+    prompt_guidance: This is a structural but single-relation edit. It may modify temporal memory plus the minimal adjacent embedding/head code needed for a coherent multi-scale context GRU, but must preserve the fixed harness, feature order, and final [batch, pred_len, enc_in] output.
+
   - id: add_degradation_trend_bias
     component: temporal_memory
     risk: medium
+    intensity: local
     diagnostics:
       late_life_error: 0.80
       residual_drift: 0.72
@@ -99,18 +147,47 @@ operators:
     description: Add a monotone/time-aware degradation trend pathway for late chronological test errors.
     prompt_guidance: Use the time feature or sequence index conservatively; avoid hard monotonic constraints that can dominate all channels.
 
+  - id: add_residual_trend_head
+    component: prediction_head
+    risk: medium
+    intensity: structural
+    template: skills/forge_model_templates/multiscale_context_gru.py
+    diagnostics:
+      long_horizon_error: 0.78
+      late_life_error: 0.70
+      residual_drift: 0.68
+      channel_imbalance: 0.55
+      train_val_gap: 0.38
+    description: Add a larger residual level/trend-aware horizon head with per-horizon calibration while preserving the temporal encoder contract.
+    prompt_guidance: "Make a head-centered structural edit: combine learned horizon residuals with a bounded last-value/trend anchor, and keep all reshape logic derived from batch, self.pred_len, and self.enc_in."
+
   - id: calibrate_factor_gate
     component: factor_fusion
     risk: medium
+    intensity: local
     diagnostics:
       dynamic_load_error: 0.86
       residual_drift: 0.45
     description: Improve how operating-condition factors modulate voltage embeddings.
     prompt_guidance: Keep the edit in factor fusion or gating; do not replace the full temporal encoder.
 
+  - id: add_context_conditioned_fusion
+    component: factor_fusion
+    risk: medium
+    intensity: structural
+    template: skills/forge_model_templates/multiscale_context_gru.py
+    diagnostics:
+      dynamic_load_error: 0.90
+      residual_drift: 0.58
+      residual_autocorrelation: 0.45
+      channel_imbalance: 0.35
+    description: Escalate factor fusion by using operating-condition context to gate voltage embeddings and temporal memory across the full input horizon.
+    prompt_guidance: This structural factor-fusion edit may add a factor encoder and bounded context gate, but must not change preprocessing, data splits, or the output schema.
+
   - id: normalize_factor_path
     component: normalization
     risk: low
+    intensity: local
     diagnostics:
       nan_instability: 0.78
       residual_drift: 0.72
@@ -122,6 +199,7 @@ operators:
   - id: add_embedding_residual
     component: input_embedding
     risk: medium
+    intensity: local
     diagnostics:
       residual_autocorrelation: 0.48
       dynamic_load_error: 0.50
@@ -131,6 +209,7 @@ operators:
   - id: increase_regularization
     component: regularization
     risk: low
+    intensity: local
     diagnostics:
       train_val_gap: 0.90
       target_degradation: 0.65
@@ -141,6 +220,7 @@ operators:
   - id: conservative_optimizer_stability
     component: optimization
     risk: low
+    intensity: local
     diagnostics:
       nan_instability: 0.72
       val_curve_instability: 0.74

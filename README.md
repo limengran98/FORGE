@@ -77,9 +77,10 @@ strict sequential chain.
 
 ## Trust Routing And Ablations
 
-FORGE supports three routing modes:
+FORGE supports four routing modes:
 
-- `trust`: diagnostic feedback propagates through learned feedback-component relations, and those relations are updated by executable outcomes.
+- `trust`: main FORGE method, matching the `pilot_trust` line. Diagnostic feedback propagates through learned feedback-component relations, and those component relations are updated by executable outcomes. The LLM is constrained by the fixed harness but is not locked to a relation-level edit operator.
+- `trust-action`: ablation mode for relation-level action memory, attention gates, negative-memory suppression, and structural operator experiments.
 - `prior`: diagnostic feedback uses fixed PEMFC priors without outcome-based trust updates.
 - `rule`: legacy rule routing only, without diagnostic trust propagation.
 
@@ -103,6 +104,7 @@ Run an ablation control by changing only the routing mode:
 ```bash
 python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 --pred-lens 12 --rounds 10 --epochs 200 --llm-mode required --routing-mode rule --parent-policy best --run-name ablate_rule_FC1_FC2_L24_P12_R10
 python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 --pred-lens 12 --rounds 10 --epochs 200 --llm-mode required --routing-mode prior --parent-policy best --run-name ablate_prior_FC1_FC2_L24_P12_R10
+python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 --pred-lens 12 --rounds 10 --epochs 200 --llm-mode required --routing-mode trust-action --parent-policy best --run-name ablate_trust_action_FC1_FC2_L24_P12_R10
 ```
 
 ## Benchmark Grid
@@ -149,7 +151,7 @@ Most FORGE protocol constants live outside Python:
 Runs are written under `runs/<run_name>/`:
 
 - `iter_000/model.py`: initial GRU source copied from `workspace/initial_model.py`
-- `iter_*/metrics.json`: normalized and inverse-voltage metrics
+- `iter_*/metrics.json`: normalized, inverse-voltage, and paper-scaled metrics
 - `iter_*/train_curve.jsonl`: epoch train/validation losses
 - `iter_*/feedback_vector.json`: noisy feedback vector and schema
 - `iter_*/routing.json`: graph routing result with diagnostic propagation evidence

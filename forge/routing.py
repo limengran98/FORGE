@@ -12,6 +12,8 @@ from .trust import (
     relation_trust,
 )
 
+TRUST_ROUTING_MODES = {"trust", "trust-action"}
+
 
 def _policy_value(policy: dict[str, Any], group: str, key: str, default: float) -> float:
     try:
@@ -32,9 +34,9 @@ def route_feedback(
     component_graph = get_component_graph()
     policy = get_routing_policy()
     mode = str(mode or "trust")
-    if mode not in {"rule", "prior", "trust"}:
-        raise ValueError("routing mode must be one of: rule, prior, trust")
-    if graph_state is not None and mode == "trust":
+    if mode not in {"rule", "prior", "trust", "trust-action"}:
+        raise ValueError("routing mode must be one of: rule, prior, trust, trust-action")
+    if graph_state is not None and mode in TRUST_ROUTING_MODES:
         ensure_trust_relations(graph_state)
     f = feedback.get("features", {})
     initial_score = float(policy.get("initial_score", 0.05))
@@ -55,7 +57,11 @@ def route_feedback(
         if not name or severity <= 0.0 or confidence <= 0.0:
             return
         for component, prior in candidate_components_for_diagnostic(name).items():
-            trust = relation_trust(graph_state or {}, name, component) if graph_state is not None and mode == "trust" else float(prior)
+            trust = (
+                relation_trust(graph_state or {}, name, component)
+                if graph_state is not None and mode in TRUST_ROUTING_MODES
+                else float(prior)
+            )
             contribution = severity * confidence * trust
             if contribution <= 0:
                 continue
@@ -118,7 +124,7 @@ def route_feedback(
         add("normalization", "mape_normalization")
         add("prediction_head", "mape_prediction_head")
 
-    if mode in {"prior", "trust"}:
+    if mode in {"prior", "trust", "trust-action"}:
         for diagnostic in feedback.get("diagnostics", []):
             if isinstance(diagnostic, dict):
                 propagate(diagnostic)
@@ -141,10 +147,11 @@ def route_feedback(
         "negative_memory": [],
         "negative_reuse_suppression": [],
         "controlled_exploration": {},
+        "structural_exploration": {},
         "relation_attention": {},
         "memory_context": feedback.get("pemfc_context") or build_pemfc_context(feedback),
     }
-    if mode in {"prior", "trust"}:
+    if mode == "trust-action":
         action_selection = select_edit_candidates(
             feedback,
             graph_state,
@@ -153,8 +160,13 @@ def route_feedback(
             mode=mode,
         )
 
-    trust_policy = {"rule": "rule_only", "prior": "trust_prior_only", "trust": "trust_graph_v1"}[mode]
-    if mode == "trust" and graph_state is None:
+    trust_policy = {
+        "rule": "rule_only",
+        "prior": "trust_prior_only",
+        "trust": "trust_graph_v1",
+        "trust-action": "trust_graph_v1_with_action_memory_ablation",
+    }[mode]
+    if mode in TRUST_ROUTING_MODES and graph_state is None:
         trust_policy = "trust_prior_only"
 
     return {
@@ -168,6 +180,7 @@ def route_feedback(
         "negative_memory": action_selection.get("negative_memory") or [],
         "negative_reuse_suppression": action_selection.get("negative_reuse_suppression") or [],
         "controlled_exploration": action_selection.get("controlled_exploration") or {},
+        "structural_exploration": action_selection.get("structural_exploration") or {},
         "relation_attention": action_selection.get("relation_attention") or {},
         "memory_context": action_selection.get("memory_context") or {},
         "trust_policy": trust_policy,
