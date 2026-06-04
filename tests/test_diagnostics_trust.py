@@ -194,3 +194,77 @@ def test_action_memory_updates_feedback_component_edit_relation():
     assert updates[0]["direction"] == "decrease"
     assert rel["trust"] < before
     assert state["action_memory"]["negative_experiences"]
+
+
+def test_off_policy_mismatch_does_not_reward_selected_relation():
+    state = initial_task_graph()
+    rid = action_relation_id("target_degradation", "regularization", "increase_regularization")
+    before = state["action_memory"]["relations"][rid]["trust"]
+    patch_record = {
+        "component": "temporal_memory",
+        "edit_action": "add_temporal_smoothing",
+        "component_mismatch": True,
+        "edit_operator_mismatch": True,
+        "selected_edit": {
+            "diagnostic": "target_degradation",
+            "component": "regularization",
+            "edit_operator": "increase_regularization",
+        },
+    }
+    previous_result = {
+        "success": True,
+        "metrics": {"target": {"mae_inverse": 1.0}},
+        "paths": {"result": "prev.json"},
+    }
+    next_result = {
+        "success": True,
+        "metrics": {"target": {"mae_inverse": 0.5}},
+        "paths": {"result": "next.json"},
+    }
+    previous_feedback = {
+        "pemfc_context": {"dataset": "FC1"},
+        "features": {"overfit_score": 0.1},
+        "diagnostics": [{"name": "target_degradation", "severity": 0.9, "confidence": 1.0}],
+    }
+    next_feedback = {
+        "pemfc_context": {"dataset": "FC1"},
+        "features": {"overfit_score": 0.1},
+        "diagnostics": [{"name": "target_degradation", "severity": 0.1, "confidence": 1.0}],
+    }
+
+    updates = update_action_memory_from_outcome(
+        state,
+        patch_record,
+        previous_result,
+        next_result,
+        previous_feedback,
+        next_feedback,
+        "mae_inverse",
+    )
+    rel = state["action_memory"]["relations"][rid]
+    assert updates[0]["evidence_policy"] == "off_policy"
+    assert updates[0]["direction"] == "off_policy"
+    assert updates[0]["reward"]["raw_reward"] > 0
+    assert rel["trust"] == before
+    assert rel.get("positive_count", 0) == 0
+
+
+def test_negative_memory_blocks_repeated_dataset_failure():
+    state = initial_task_graph()
+    rid = action_relation_id("train_val_gap", "regularization", "increase_regularization")
+    rel = state["action_memory"]["relations"][rid]
+    rel["negative_count"] = 4
+    rel["last_negative_update"] = 3
+    rel["dataset_stats"] = {"FC2": {"negative_count": 3, "last_negative_update": 3}}
+    state["action_memory"]["update_count"] = 4
+    feedback = {
+        "pemfc_context": {"dataset": "FC2"},
+        "features": {"run_success": 1.0},
+        "diagnostics": [{"name": "train_val_gap", "severity": 1.0, "confidence": 1.0, "evidence": {}}],
+    }
+    route = route_feedback(feedback, state)
+    blocked = [row for row in route["edit_candidates"] if row["relation_id"] == rid]
+    assert blocked and blocked[0]["blocked"] is True
+    assert blocked[0]["suppression"]["cooldown_remaining"] > 0
+    assert route["negative_reuse_suppression"]
+    assert route["selected_edit"]["relation_id"] != rid

@@ -7,7 +7,19 @@ prior_strength: 2.0
 selection:
   max_candidates: 8
   exploration_bonus: 0.02
-  negative_penalty: 0.10
+  negative_penalty: 0.16
+  dataset_negative_penalty: 0.08
+  cooldown_penalty: 0.20
+  cooldown_updates: 2
+  block_negative_count: 4
+  block_dataset_negative_count: 3
+  block_validation_failures: 1
+  controlled_exploration:
+    enabled: true
+    score_margin: 0.04
+    min_operator_trust: 0.50
+    max_negative_count: 1
+    prefer_untried: true
 
 update:
   target_weight: 0.25
@@ -18,6 +30,7 @@ update:
   update_scale: 2.0
   max_update: 1.0
   validation_failure_penalty: 0.35
+  agreement_trust_threshold: 0.65
 
 operators:
   - id: preserve_harness_contract

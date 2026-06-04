@@ -256,6 +256,8 @@ class GraphOrchestrator:
             "selected_edit": route.get("selected_edit"),
             "edit_candidates": route.get("edit_candidates") or [],
             "negative_memory": route.get("negative_memory") or [],
+            "negative_reuse_suppression": route.get("negative_reuse_suppression") or [],
+            "controlled_exploration": route.get("controlled_exploration") or {},
             "memory_context": route.get("memory_context") or {},
         }
         self._update_component_evidence(iteration, route, result, feedback)
@@ -336,6 +338,8 @@ class GraphOrchestrator:
             "selected_edit": patch_meta.get("selected_edit"),
             "edit_candidates": patch_meta.get("edit_candidates") or [],
             "negative_memory": patch_meta.get("negative_memory") or [],
+            "negative_reuse_suppression": patch_meta.get("negative_reuse_suppression") or [],
+            "controlled_exploration": patch_meta.get("controlled_exploration") or {},
             "memory_context": patch_meta.get("memory_context") or {},
             "edit_action": patch_meta.get("edit_action"),
             "edit_operator_mismatch": bool(patch_meta.get("edit_operator_mismatch", False)),

@@ -81,6 +81,8 @@ def write_iteration_report(
             f":: `{selected_edit.get('edit_operator')}` score={selected_edit.get('score')} "
             f"operator_trust={selected_edit.get('operator_trust')}"
         )
+        if selected_edit.get("exploration_selected"):
+            lines.append(f"- Controlled exploration: `{selected_edit.get('exploration_reason')}`")
         if selected_edit.get("prompt_guidance"):
             lines.append(f"- Guidance: {selected_edit.get('prompt_guidance')}")
         lines.append("")
@@ -99,8 +101,27 @@ def write_iteration_report(
         for item in negative_memory[:5]:
             lines.append(
                 f"- `{item.get('relation_id')}` trust={item.get('trust')} "
-                f"negative_count={item.get('negative_count')} validation_failures={item.get('validation_failures')}"
+                f"negative_count={item.get('negative_count')} dataset_negatives={item.get('dataset_negative_count')} "
+                f"cooldown={item.get('cooldown_remaining')} blocked={item.get('blocked')} "
+                f"validation_failures={item.get('validation_failures')}"
             )
+        lines.append("")
+    suppressions = route.get("negative_reuse_suppression") or []
+    if suppressions:
+        lines.extend(["### Negative Reuse Suppression", ""])
+        for item in suppressions[:5]:
+            suppression = item.get("suppression", {})
+            lines.append(
+                f"- `{item.get('relation_id')}` score={item.get('score')} "
+                f"penalty={suppression.get('total_penalty')} cooldown={suppression.get('cooldown_remaining')} "
+                f"blocked={suppression.get('blocked')}"
+            )
+        lines.append("")
+    exploration = route.get("controlled_exploration") or {}
+    if exploration:
+        lines.extend(["### Controlled Exploration", ""])
+        lines.append(f"- Enabled: `{bool(exploration.get('enabled'))}`")
+        lines.append(f"- Selected exploration candidate: `{bool(exploration.get('selected'))}`")
         lines.append("")
     if trust_updates:
         lines.extend(["## Trust Updates From Executable Outcome", ""])
@@ -116,11 +137,13 @@ def write_iteration_report(
         lines.extend(["## Action Memory Updates From Probe-Aligned Outcome", ""])
         for item in action_memory_updates:
             reward = item.get("reward", {})
+            agreement = item.get("trust_outcome_agreement", {})
             lines.append(
                 f"- `{item.get('diagnostic')}` -> `{item.get('component')}` :: `{item.get('edit_operator')}` "
                 f"{item.get('direction')}: {item.get('trust_before')} -> {item.get('trust_after')} "
-                f"reward={reward.get('reward')} probe_delta={reward.get('diagnostic_delta')} "
-                f"status={item.get('candidate_status')}"
+                f"policy={item.get('evidence_policy')} reward={reward.get('reward')} raw={reward.get('raw_reward')} "
+                f"probe_delta={reward.get('diagnostic_delta')} status={item.get('candidate_status')} "
+                f"agreement={agreement.get('label')}"
             )
         lines.append("")
     if patch_meta:

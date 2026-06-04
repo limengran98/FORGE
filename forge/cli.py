@@ -377,6 +377,8 @@ def _generate_patch_for_next_iteration(
     patch_meta["selected_edit"] = selected_edit
     patch_meta["edit_candidates"] = route.get("edit_candidates") or []
     patch_meta["negative_memory"] = route.get("negative_memory") or []
+    patch_meta["negative_reuse_suppression"] = route.get("negative_reuse_suppression") or []
+    patch_meta["controlled_exploration"] = route.get("controlled_exploration") or {}
     patch_meta["memory_context"] = route.get("memory_context") or feedback.get("pemfc_context") or {}
     patch_meta["edit_operator_mismatch"] = bool(
         selected_operator

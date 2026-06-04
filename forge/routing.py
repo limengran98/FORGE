@@ -139,6 +139,8 @@ def route_feedback(
         "selected_edit": None,
         "edit_candidates": [],
         "negative_memory": [],
+        "negative_reuse_suppression": [],
+        "controlled_exploration": {},
         "memory_context": feedback.get("pemfc_context") or build_pemfc_context(feedback),
     }
     if mode in {"prior", "trust"}:
@@ -163,6 +165,8 @@ def route_feedback(
         "selected_edit": action_selection.get("selected_edit"),
         "edit_candidates": action_selection.get("edit_candidates") or [],
         "negative_memory": action_selection.get("negative_memory") or [],
+        "negative_reuse_suppression": action_selection.get("negative_reuse_suppression") or [],
+        "controlled_exploration": action_selection.get("controlled_exploration") or {},
         "memory_context": action_selection.get("memory_context") or {},
         "trust_policy": trust_policy,
         "component_graph": component_graph,
