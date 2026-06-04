@@ -75,6 +75,28 @@ then evaluates the next model.
 next edit from the current best model source. `--parent-policy last` gives a
 strict sequential chain.
 
+## Evidence Dispatch
+
+After Diagnostic Probers finish, run Evidence Dispatch once to ask the LLM for a
+single evidence-grounded final candidate. The best prober model is copied as a
+protected parent first, and the dispatcher candidate is accepted only if the same
+fixed PEMFC harness shows non-regression on the target metric and MSE plus an
+executable improvement in the target metric, MSE, or selected diagnostic probes.
+Otherwise the final model is the protected prober best.
+
+```bash
+python -m forge.cli dispatch \
+  --run-dir runs/<sweep_name>/FC1_L24_P12 \
+  --llm-mode required \
+  --target-diagnostics long_horizon_error residual_autocorrelation residual_drift \
+  --device cuda \
+  --cuda-id 0
+```
+
+The dispatch artifact is saved under
+`runs/<run_name>/evidence_dispatch*/` with `protected_best/`, `candidate/`,
+`final/`, `dispatch_payload.json`, and `dispatch_summary.json`.
+
 ## Trust Routing And Ablations
 
 FORGE supports four routing modes:
@@ -145,6 +167,7 @@ Most FORGE protocol constants live outside Python:
 - `configs/harness/heuristic_patches.yaml`: component-to-template fallback mapping
 - `skills/forge_model_templates/`: complete fallback model templates
 - `prompts/model_patch.yaml`: LLM patch prompt
+- `prompts/evidence_dispatch.yaml`: protected final-candidate dispatch prompt
 
 ## Outputs
 
@@ -159,6 +182,7 @@ Runs are written under `runs/<run_name>/`:
 - `task_graph.json`: evolving component graph state and feedback-component trust relations
 - `graph_events.jsonl`: append-only orchestration event log
 - `summary.json`: run-level summary
+- `evidence_dispatch*/dispatch_summary.json`: protected best, dispatcher candidate, harness decision, and final model path
 
 ## Graph Orchestration
 

@@ -87,6 +87,10 @@ def _load_repair_prompt() -> dict[str, str]:
     return _load_prompt_file("model_repair.yaml")
 
 
+def _load_dispatch_prompt() -> dict[str, str]:
+    return _load_prompt_file("evidence_dispatch.yaml")
+
+
 def _load_prompt_file(name: str) -> dict[str, str]:
     prompt_path = PROMPTS_DIR / name
     prompt = load_yaml(prompt_path)
@@ -214,6 +218,43 @@ def request_llm_repair_patch(
         component=str(response.get("component", broken_candidate.component or route.get("primary_component", ""))),
         origin="llm_repair",
         edit_action=str(response.get("edit_action", "repair_validation_error")),
+        raw_response=response,
+    )
+
+
+def request_llm_dispatch_patch(
+    llm_config: dict[str, Any],
+    protected_source: str,
+    payload: dict[str, Any],
+) -> PatchCandidate:
+    prompt = _load_dispatch_prompt()
+    dispatch_payload = {
+        "harness_spec": load_pemfc_harness_spec(),
+        "protected_best_model_source": protected_source,
+        **payload,
+    }
+    user_text = prompt["user_template"].replace(
+        "${payload_json}",
+        json.dumps(dispatch_payload, indent=2, ensure_ascii=False),
+    )
+    response = chat_json(
+        [
+            {"role": "system", "content": prompt["system"]},
+            {"role": "user", "content": user_text},
+        ],
+        llm_config,
+    )
+    source = response.get("full_source") or response.get("source") or ""
+    class_name = get_model_class_name()
+    if not isinstance(source, str) or f"class {class_name}" not in source:
+        raise ValueError(f"LLM dispatch response must include full_source defining class {class_name}")
+    return PatchCandidate(
+        source=source.strip() + "\n",
+        rationale=str(response.get("rationale", "")),
+        summary=str(response.get("summary", "")),
+        component=str(response.get("component", "evidence_dispatch")),
+        origin="llm_dispatch",
+        edit_action=str(response.get("edit_action", "evidence_dispatch_refinement")),
         raw_response=response,
     )
 

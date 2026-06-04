@@ -3,7 +3,13 @@ from argparse import Namespace
 
 import pytest
 
-from forge.cli import _maybe_refresh_parent_sweep_summary, _parent_baseline_for_patch, _resolve_continue_target, build_parser
+from forge.cli import (
+    _accept_dispatch_candidate,
+    _maybe_refresh_parent_sweep_summary,
+    _parent_baseline_for_patch,
+    _resolve_continue_target,
+    build_parser,
+)
 from forge.orchestrator import GraphOrchestrator
 
 
@@ -84,6 +90,91 @@ def test_sweep_parser_accepts_trust_action_ablation_mode():
         ]
     )
     assert args.routing_mode == "trust-action"
+
+
+def test_dispatch_parser_accepts_protected_evidence_dispatch():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "dispatch",
+            "--run-dir",
+            "runs/demo/FC1_L24_P12",
+            "--llm-mode",
+            "required",
+            "--target-diagnostics",
+            "long_horizon_error",
+            "residual_autocorrelation",
+            "--device",
+            "cuda",
+            "--cuda-id",
+            "0",
+        ]
+    )
+    assert args.run_dir == "runs/demo/FC1_L24_P12"
+    assert args.llm_mode == "required"
+    assert args.target_diagnostics == ["long_horizon_error", "residual_autocorrelation"]
+
+
+def test_dispatch_candidate_rejects_metric_regression():
+    protected = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.10},
+            "inverse": {"mse": 0.20},
+        },
+    }
+    candidate = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.11},
+            "inverse": {"mse": 0.19},
+        },
+    }
+    feedback = {"diagnostics": [{"name": "long_horizon_error", "severity": 0.8, "confidence": 1.0}]}
+    candidate_feedback = {"diagnostics": [{"name": "long_horizon_error", "severity": 0.1, "confidence": 1.0}]}
+
+    decision = _accept_dispatch_candidate(
+        protected,
+        candidate,
+        feedback,
+        candidate_feedback,
+        "mae_inverse",
+        target_diagnostics=["long_horizon_error"],
+    )
+
+    assert decision["accepted"] is False
+    assert decision["reason"] == "target_metric_regressed"
+
+
+def test_dispatch_candidate_accepts_non_regression_with_probe_gain():
+    protected = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.10},
+            "inverse": {"mse": 0.20},
+        },
+    }
+    candidate = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.10},
+            "inverse": {"mse": 0.20},
+        },
+    }
+    feedback = {"diagnostics": [{"name": "long_horizon_error", "severity": 0.8, "confidence": 1.0}]}
+    candidate_feedback = {"diagnostics": [{"name": "long_horizon_error", "severity": 0.2, "confidence": 1.0}]}
+
+    decision = _accept_dispatch_candidate(
+        protected,
+        candidate,
+        feedback,
+        candidate_feedback,
+        "mae_inverse",
+        target_diagnostics=["long_horizon_error"],
+    )
+
+    assert decision["accepted"] is True
+    assert decision["reason"] == "accepted_by_non_regression_harness"
 
 
 def test_continue_target_defaults_to_one_more_round():
