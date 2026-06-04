@@ -379,15 +379,14 @@ def _generate_patch_for_next_iteration(
     patch_meta["negative_memory"] = route.get("negative_memory") or []
     patch_meta["negative_reuse_suppression"] = route.get("negative_reuse_suppression") or []
     patch_meta["controlled_exploration"] = route.get("controlled_exploration") or {}
+    patch_meta["relation_attention"] = route.get("relation_attention") or {}
     patch_meta["memory_context"] = route.get("memory_context") or feedback.get("pemfc_context") or {}
     patch_meta["edit_operator_mismatch"] = bool(
         selected_operator
-        and patch_meta.get("origin") in {"llm", "llm_repair"}
         and (not actual_operator or actual_operator != selected_operator)
     )
     patch_meta["component_mismatch"] = bool(
         selected_component
-        and patch_meta.get("origin") in {"llm", "llm_repair"}
         and (not actual_component or actual_component != selected_component)
     )
     patch_meta["parent_model_path"] = str(current_model_path)

@@ -141,6 +141,7 @@ def route_feedback(
         "negative_memory": [],
         "negative_reuse_suppression": [],
         "controlled_exploration": {},
+        "relation_attention": {},
         "memory_context": feedback.get("pemfc_context") or build_pemfc_context(feedback),
     }
     if mode in {"prior", "trust"}:
@@ -167,6 +168,7 @@ def route_feedback(
         "negative_memory": action_selection.get("negative_memory") or [],
         "negative_reuse_suppression": action_selection.get("negative_reuse_suppression") or [],
         "controlled_exploration": action_selection.get("controlled_exploration") or {},
+        "relation_attention": action_selection.get("relation_attention") or {},
         "memory_context": action_selection.get("memory_context") or {},
         "trust_policy": trust_policy,
         "component_graph": component_graph,

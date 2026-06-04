@@ -246,6 +246,18 @@ def validate_harness_specs() -> None:
             raise ValueError(f"trust prior for {diagnostic!r} references unknown components: {unknown}")
 
     edit_operator_ids: set[str] = set()
+    edit_spec = get_edit_operator_spec()
+    selection = edit_spec.get("selection", {})
+    if isinstance(selection, dict):
+        attention = selection.get("relation_attention", {})
+        if isinstance(attention, dict) and attention.get("enabled", True):
+            min_tau = float(attention.get("min_temperature", 0.10))
+            base_tau = float(attention.get("base_temperature", 0.30))
+            max_tau = float(attention.get("max_temperature", 0.60))
+            if not (0.0 < min_tau <= base_tau <= max_tau):
+                raise ValueError("edit_operators.yaml relation_attention temperatures must satisfy 0 < min <= base <= max")
+            if int(attention.get("sample_top_k", 1)) < 1:
+                raise ValueError("edit_operators.yaml relation_attention.sample_top_k must be positive")
     for operator in get_edit_operators():
         op_id = str(operator.get("id") or "")
         component = str(operator.get("component") or "")

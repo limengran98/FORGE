@@ -81,10 +81,29 @@ def write_iteration_report(
             f":: `{selected_edit.get('edit_operator')}` score={selected_edit.get('score')} "
             f"operator_trust={selected_edit.get('operator_trust')}"
         )
+        if selected_edit.get("attention_weight") is not None:
+            lines.append(
+                f"- Attention: weight={selected_edit.get('attention_weight')} "
+                f"score={selected_edit.get('attention_score')} tau={selected_edit.get('relation_temperature')}"
+            )
+        if selected_edit.get("attention_sampled"):
+            lines.append(f"- Attention sample: `{selected_edit.get('attention_sample_reason')}`")
         if selected_edit.get("exploration_selected"):
             lines.append(f"- Controlled exploration: `{selected_edit.get('exploration_reason')}`")
         if selected_edit.get("prompt_guidance"):
             lines.append(f"- Guidance: {selected_edit.get('prompt_guidance')}")
+        lines.append("")
+    attention = route.get("relation_attention") or {}
+    if attention:
+        lines.extend(["### Trust-Calibrated Relation Attention", ""])
+        lines.append(
+            f"- Enabled: `{bool(attention.get('enabled'))}` temperature=`{attention.get('temperature')}` "
+            f"entropy=`{attention.get('weights_entropy')}` selected_by=`{attention.get('selected_by')}`"
+        )
+        factors = attention.get("factors") or {}
+        if factors:
+            factor_text = ", ".join(f"{key}={value}" for key, value in factors.items())
+            lines.append(f"- Temperature factors: {factor_text}")
         lines.append("")
     candidates = route.get("edit_candidates") or []
     if candidates:
@@ -92,7 +111,8 @@ def write_iteration_report(
         for item in candidates[:5]:
             lines.append(
                 f"- `{item.get('diagnostic')}` -> `{item.get('component')}` :: `{item.get('edit_operator')}` "
-                f"score={item.get('score')} trust={item.get('operator_trust')} negatives={item.get('negative_count')}"
+                f"score={item.get('score')} attention={item.get('attention_weight')} "
+                f"trust={item.get('operator_trust')} negatives={item.get('negative_count')}"
             )
         lines.append("")
     negative_memory = route.get("negative_memory") or []

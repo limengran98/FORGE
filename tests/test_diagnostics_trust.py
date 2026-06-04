@@ -268,3 +268,25 @@ def test_negative_memory_blocks_repeated_dataset_failure():
     assert blocked[0]["suppression"]["cooldown_remaining"] > 0
     assert route["negative_reuse_suppression"]
     assert route["selected_edit"]["relation_id"] != rid
+
+
+def test_relation_attention_metadata_and_temperature_are_recorded():
+    state = initial_task_graph()
+    feedback = {
+        "current_target": 1.1,
+        "best_target": 1.0,
+        "pemfc_context": {"dataset": "FC1"},
+        "features": {"run_success": 1.0, "improved_vs_best": 0.0},
+        "diagnostics": [
+            {"name": "long_horizon_error", "severity": 0.8, "confidence": 0.9, "evidence": {}},
+            {"name": "residual_autocorrelation", "severity": 0.7, "confidence": 0.9, "evidence": {}},
+        ],
+    }
+    route = route_feedback(feedback, state)
+    attention = route["relation_attention"]
+    assert attention["enabled"] is True
+    assert attention["temperature"] >= attention["base_temperature"]
+    weights = [row["attention_weight"] for row in route["edit_candidates"] if not row.get("blocked")]
+    assert weights
+    assert 0.99 <= sum(weights) <= 1.01
+    assert route["selected_edit"]["attention_weight"] > 0
