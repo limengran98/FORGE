@@ -5,6 +5,7 @@ import pytest
 
 from forge.cli import (
     _accept_dispatch_candidate,
+    _dispatch_patch_quality,
     _maybe_refresh_parent_sweep_summary,
     _parent_baseline_for_patch,
     _resolve_continue_target,
@@ -112,7 +113,69 @@ def test_dispatch_parser_accepts_protected_evidence_dispatch():
     )
     assert args.run_dir == "runs/demo/FC1_L24_P12"
     assert args.llm_mode == "required"
+    assert args.dispatch_mode == "summary"
     assert args.target_diagnostics == ["long_horizon_error", "residual_autocorrelation"]
+    assert args.evidence_scope == "current-run"
+    assert args.dispatch_candidates is None
+    assert args.archive_candidates == 0
+
+
+def test_sweep_parser_defaults_final_dispatch_to_summary_only():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "sweep",
+            "--datasets",
+            "FC1",
+            "FC2",
+            "--seq-lens",
+            "24",
+            "--pred-lens",
+            "12",
+            "--rounds",
+            "20",
+            "--llm-mode",
+            "required",
+            "--final-dispatch",
+            "--archive-candidates",
+            "0",
+        ]
+    )
+    assert args.final_dispatch is True
+    assert args.dispatch_mode == "summary"
+    assert args.dispatch_candidates is None
+    assert args.archive_candidates == 0
+
+
+def test_sweep_parser_accepts_candidate_dispatch_ablation():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "sweep",
+            "--datasets",
+            "FC1",
+            "FC2",
+            "--seq-lens",
+            "24",
+            "--pred-lens",
+            "12",
+            "--rounds",
+            "20",
+            "--llm-mode",
+            "required",
+            "--final-dispatch",
+            "--dispatch-mode",
+            "candidates",
+            "--dispatch-candidates",
+            "4",
+            "--archive-candidates",
+            "0",
+        ]
+    )
+    assert args.final_dispatch is True
+    assert args.dispatch_mode == "candidates"
+    assert args.dispatch_candidates == 4
+    assert args.archive_candidates == 0
 
 
 def test_dispatch_candidate_rejects_metric_regression():
@@ -175,6 +238,132 @@ def test_dispatch_candidate_accepts_non_regression_with_probe_gain():
 
     assert decision["accepted"] is True
     assert decision["reason"] == "accepted_by_non_regression_harness"
+
+
+def test_dispatch_candidate_accepts_ms_aednet_gap_shrink():
+    protected = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.10},
+            "inverse": {"mse": 0.20},
+            "paper_scaled": {"mae": 5.00, "mse": 12.00},
+        },
+    }
+    candidate = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.09},
+            "inverse": {"mse": 0.18},
+            "paper_scaled": {"mae": 4.80, "mse": 11.20},
+        },
+    }
+
+    decision = _accept_dispatch_candidate(
+        protected,
+        candidate,
+        {"diagnostics": []},
+        {"diagnostics": []},
+        "mae_inverse",
+        paper_baseline={"method": "Ms-AeDNet", "mae": 4.56, "mse": 10.40},
+    )
+
+    assert decision["accepted"] is True
+    assert decision["reason"] == "accepted_by_counterfactual_gap_harness"
+    assert decision["paper_gap_decision"]["gap_delta"]["total"] > 0
+
+
+def test_dispatch_candidate_rejects_probe_gain_without_ms_aednet_gap_shrink():
+    protected = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.10},
+            "inverse": {"mse": 0.20},
+            "paper_scaled": {"mae": 5.00, "mse": 12.00},
+        },
+    }
+    candidate = {
+        "success": True,
+        "metrics": {
+            "target": {"mae_inverse": 0.10},
+            "inverse": {"mse": 0.20},
+            "paper_scaled": {"mae": 5.00, "mse": 12.00},
+        },
+    }
+    feedback = {"diagnostics": [{"name": "residual_drift", "severity": 0.8, "confidence": 1.0}]}
+    candidate_feedback = {"diagnostics": [{"name": "residual_drift", "severity": 0.1, "confidence": 1.0}]}
+
+    decision = _accept_dispatch_candidate(
+        protected,
+        candidate,
+        feedback,
+        candidate_feedback,
+        "mae_inverse",
+        target_diagnostics=["residual_drift"],
+        paper_baseline={"method": "Ms-AeDNet", "mae": 4.56, "mse": 10.40},
+    )
+
+    assert decision["accepted"] is False
+    assert decision["reason"] == "ms_aednet_gap_not_shrunk"
+
+
+def test_dispatch_patch_quality_rejects_noop_comment_patch():
+    parent = "import torch\nclass ForgeModel:\n    def __init__(self):\n        self.head = 1\n"
+    candidate = "import torch\nclass ForgeModel:\n    def __init__(self):\n        # same head\n        self.head = 1\n"
+
+    quality = _dispatch_patch_quality(parent, candidate)
+
+    assert quality["passed"] is False
+    assert quality["reason"] == "motif_no_effect"
+
+
+def test_dispatch_patch_quality_rejects_destructive_transplant():
+    parent = """
+class ForgeModel:
+    def __init__(self):
+        self.head = 1
+        self.gate = 2
+        self.limiter = 3
+        self.trend = 4
+    def forward(self, x):
+        return self.head + self.gate + self.limiter + self.trend
+"""
+    candidate = """
+class ForgeModel:
+    def __init__(self):
+        self.new_gate = 5
+    def forward(self, x):
+        return self.new_gate
+"""
+
+    quality = _dispatch_patch_quality(parent, candidate)
+
+    assert quality["passed"] is False
+    assert quality["reason"] == "destructive_motif_transplant"
+
+
+def test_dispatch_patch_quality_accepts_additive_transplant():
+    parent = """
+class ForgeModel:
+    def __init__(self):
+        self.head = 1
+    def forward(self, x):
+        return self.head
+"""
+    candidate = """
+class ForgeModel:
+    def __init__(self):
+        self.head = 1
+        self.motif_gate = 2
+        self.motif_scale = 3
+    def forward(self, x):
+        y = self.head
+        return y + self.motif_gate * self.motif_scale
+"""
+
+    quality = _dispatch_patch_quality(parent, candidate)
+
+    assert quality["passed"] is True
+    assert quality["reason"] == "motif_quality_passed"
 
 
 def test_continue_target_defaults_to_one_more_round():

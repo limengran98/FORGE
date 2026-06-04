@@ -91,6 +91,10 @@ def _load_dispatch_prompt() -> dict[str, str]:
     return _load_prompt_file("evidence_dispatch.yaml")
 
 
+def _load_dispatch_summary_prompt() -> dict[str, str]:
+    return _load_prompt_file("evidence_summary.yaml")
+
+
 def _load_prompt_file(name: str) -> dict[str, str]:
     prompt_path = PROMPTS_DIR / name
     prompt = load_yaml(prompt_path)
@@ -257,6 +261,28 @@ def request_llm_dispatch_patch(
         edit_action=str(response.get("edit_action", "evidence_dispatch_refinement")),
         raw_response=response,
     )
+
+
+def request_llm_dispatch_summary(llm_config: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    prompt = _load_dispatch_summary_prompt()
+    dispatch_payload = {
+        "harness_spec": load_pemfc_harness_spec(),
+        **payload,
+    }
+    user_text = prompt["user_template"].replace(
+        "${payload_json}",
+        json.dumps(dispatch_payload, indent=2, ensure_ascii=False),
+    )
+    response = chat_json(
+        [
+            {"role": "system", "content": prompt["system"]},
+            {"role": "user", "content": user_text},
+        ],
+        llm_config,
+    )
+    if not isinstance(response, dict):
+        raise ValueError("LLM dispatch summary response must be a JSON object")
+    return response
 
 
 def safety_fallback_candidate(parent_source: str, route: dict[str, Any], reason: str) -> PatchCandidate:

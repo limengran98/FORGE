@@ -19,6 +19,17 @@ datasets:
       mae: 100
       mse: 1000
 
+paper_baselines:
+  Ms-AeDNet:
+    FC1:
+      L24_P12:
+        mae: 4.56
+        mse: 10.40
+    FC2:
+      L24_P12:
+        mae: 4.76
+        mse: 9.59
+
 features:
   voltage_inputs:
     - U1 (V)

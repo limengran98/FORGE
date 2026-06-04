@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
+import math
 import re
 import shutil
 from datetime import datetime
@@ -17,8 +19,10 @@ from .harness_spec import (
     get_benchmark_grid,
     get_dataset_files,
     get_default_dataset_name,
+    get_dataset_metric_scales,
     get_enc_in,
     get_feature_dim,
+    load_pemfc_harness_spec,
     validate_harness_specs,
 )
 from .llm import load_llm_config
@@ -30,6 +34,7 @@ from .patching import (
     apply_candidate,
     heuristic_patch_source,
     request_llm_dispatch_patch,
+    request_llm_dispatch_summary,
     request_llm_patch,
     request_llm_repair_patch,
     safety_fallback_candidate,
@@ -534,11 +539,94 @@ def _paper_metric_summary(result: dict[str, Any]) -> dict[str, Any]:
     paper = metrics.get("paper_scaled") or {}
     inverse = metrics.get("inverse") or {}
     return {
-        "paper_mae": paper.get("mae"),
-        "paper_mse": paper.get("mse"),
+        "paper_mae": _paper_mae_value(result),
+        "paper_mse": _paper_mse_value(result),
         "mae_inverse": inverse.get("mae"),
         "mse_inverse": inverse.get("mse"),
         "target": metrics.get("target", {}),
+    }
+
+
+def _result_dataset_name(result: dict[str, Any]) -> str | None:
+    data_name = (result.get("data") or {}).get("data_name")
+    if data_name:
+        return str(data_name)
+    data_name = (result.get("config") or {}).get("data_name")
+    if data_name:
+        return str(data_name)
+    return None
+
+
+def _paper_mae_value(result: dict[str, Any]) -> float:
+    if not result.get("success"):
+        return float("inf")
+    metrics = result.get("metrics", {})
+    value = metrics.get("paper_scaled", {}).get("mae")
+    if value is not None:
+        return _safe_metric(value)
+    inverse = metrics.get("inverse", {}).get("mae")
+    if inverse is None:
+        inverse = metrics.get("target", {}).get("mae_inverse")
+    dataset = _result_dataset_name(result)
+    if inverse is not None and dataset:
+        return _safe_metric(inverse) * get_dataset_metric_scales(dataset)["mae"]
+    return float("inf")
+
+
+def _paper_mse_value(result: dict[str, Any]) -> float:
+    if not result.get("success"):
+        return float("inf")
+    metrics = result.get("metrics", {})
+    value = metrics.get("paper_scaled", {}).get("mse")
+    if value is not None:
+        return _safe_metric(value)
+    inverse = metrics.get("inverse", {}).get("mse")
+    dataset = _result_dataset_name(result)
+    if inverse is not None and dataset:
+        return _safe_metric(inverse) * get_dataset_metric_scales(dataset)["mse"]
+    return float("inf")
+
+
+def _paper_positive_gap(result: dict[str, Any], paper_baseline: dict[str, float] | None) -> dict[str, float]:
+    if not paper_baseline:
+        return {}
+    mae_gap = max(0.0, _paper_mae_value(result) - float(paper_baseline["mae"]))
+    mse_gap = max(0.0, _paper_mse_value(result) - float(paper_baseline["mse"]))
+    return {"mae": mae_gap, "mse": mse_gap, "total": mae_gap + mse_gap}
+
+
+def _load_paper_baseline(
+    hcfg: HarnessConfig,
+    method: str = "Ms-AeDNet",
+    override_mae: float | None = None,
+    override_mse: float | None = None,
+) -> dict[str, Any] | None:
+    if override_mae is not None and override_mse is not None:
+        return {
+            "method": method,
+            "dataset": hcfg.data_name,
+            "seq_len": hcfg.seq_len,
+            "pred_len": hcfg.pred_len,
+            "mae": float(override_mae),
+            "mse": float(override_mse),
+            "source": "cli_override",
+        }
+
+    baselines = load_pemfc_harness_spec().get("paper_baselines", {})
+    method_map = baselines.get(method) or baselines.get(str(method)) or {}
+    dataset_map = method_map.get(str(hcfg.data_name).upper(), {}) if isinstance(method_map, dict) else {}
+    key = f"L{int(hcfg.seq_len)}_P{int(hcfg.pred_len)}"
+    row = dataset_map.get(key, {}) if isinstance(dataset_map, dict) else {}
+    if not isinstance(row, dict) or row.get("mae") is None or row.get("mse") is None:
+        return None
+    return {
+        "method": method,
+        "dataset": hcfg.data_name,
+        "seq_len": hcfg.seq_len,
+        "pred_len": hcfg.pred_len,
+        "mae": float(row["mae"]),
+        "mse": float(row["mse"]),
+        "source": "configs/harness/pemfc_harness.yaml",
     }
 
 
@@ -562,6 +650,12 @@ def _relative_improvement(previous: float, current: float) -> float:
     return (previous - current) / (abs(previous) + 1e-12)
 
 
+def _finite_delta(previous: float, current: float) -> float:
+    if not math.isfinite(previous) or not math.isfinite(current):
+        return 0.0
+    return previous - current
+
+
 def _accept_dispatch_candidate(
     protected_result: dict[str, Any],
     candidate_result: dict[str, Any],
@@ -570,6 +664,7 @@ def _accept_dispatch_candidate(
     target_metric: str,
     target_diagnostics: list[str] | None = None,
     min_relative_improvement: float = 0.0,
+    paper_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target_diagnostics = target_diagnostics or _dominant_diagnostics(protected_feedback)
     protected_target = _target_metric_value(protected_result, target_metric)
@@ -594,22 +689,80 @@ def _accept_dispatch_candidate(
     mse_improved = mse_rel_improvement > min_relative_improvement
     diagnostic_improved = bool(improved_probes) and sum(probe_deltas.values()) > 1e-9
 
-    accepted = bool(
-        candidate_result.get("success")
-        and target_non_regression
-        and mse_non_regression
-        and (target_improved or mse_improved or diagnostic_improved)
-    )
+    protected_paper_mae = _paper_mae_value(protected_result)
+    protected_paper_mse = _paper_mse_value(protected_result)
+    candidate_paper_mae = _paper_mae_value(candidate_result)
+    candidate_paper_mse = _paper_mse_value(candidate_result)
+    paper_gap_decision: dict[str, Any] = {}
+    if paper_baseline:
+        protected_gap = _paper_positive_gap(protected_result, paper_baseline)
+        candidate_gap = _paper_positive_gap(candidate_result, paper_baseline)
+        paper_mae_non_regression = candidate_paper_mae <= protected_paper_mae + 1e-12
+        paper_mse_non_regression = candidate_paper_mse <= protected_paper_mse + 1e-12
+        gap_mae_non_increase = candidate_gap["mae"] <= protected_gap["mae"] + 1e-12
+        gap_mse_non_increase = candidate_gap["mse"] <= protected_gap["mse"] + 1e-12
+        protected_has_gap = protected_gap["total"] > 1e-12
+        if protected_has_gap:
+            gap_shrunk = (
+                candidate_gap["total"]
+                < protected_gap["total"] * (1.0 - max(0.0, float(min_relative_improvement))) - 1e-12
+            )
+        else:
+            gap_shrunk = (
+                candidate_paper_mae < protected_paper_mae - 1e-12
+                or candidate_paper_mse < protected_paper_mse - 1e-12
+            )
+        paper_gap_decision = {
+            "baseline": paper_baseline,
+            "protected_paper_mae": protected_paper_mae,
+            "protected_paper_mse": protected_paper_mse,
+            "candidate_paper_mae": candidate_paper_mae,
+            "candidate_paper_mse": candidate_paper_mse,
+            "protected_gap": protected_gap,
+            "candidate_gap": candidate_gap,
+            "gap_delta": {
+                "mae": protected_gap["mae"] - candidate_gap["mae"],
+                "mse": protected_gap["mse"] - candidate_gap["mse"],
+                "total": protected_gap["total"] - candidate_gap["total"],
+            },
+            "paper_mae_non_regression": paper_mae_non_regression,
+            "paper_mse_non_regression": paper_mse_non_regression,
+            "gap_mae_non_increase": gap_mae_non_increase,
+            "gap_mse_non_increase": gap_mse_non_increase,
+            "gap_shrunk": gap_shrunk,
+            "protected_already_clears_baseline": not protected_has_gap,
+        }
+    else:
+        paper_gap_decision = {
+            "baseline": None,
+            "protected_paper_mae": protected_paper_mae,
+            "protected_paper_mse": protected_paper_mse,
+            "candidate_paper_mae": candidate_paper_mae,
+            "candidate_paper_mse": candidate_paper_mse,
+        }
+
     if not candidate_result.get("success"):
         reason = "candidate_harness_failed"
     elif not target_non_regression:
         reason = "target_metric_regressed"
     elif not mse_non_regression:
         reason = "mse_regressed"
-    elif not (target_improved or mse_improved or diagnostic_improved):
+    elif paper_baseline and not paper_gap_decision["paper_mae_non_regression"]:
+        reason = "paper_mae_regressed"
+    elif paper_baseline and not paper_gap_decision["paper_mse_non_regression"]:
+        reason = "paper_mse_regressed"
+    elif paper_baseline and not paper_gap_decision["gap_mae_non_increase"]:
+        reason = "paper_mae_gap_increased"
+    elif paper_baseline and not paper_gap_decision["gap_mse_non_increase"]:
+        reason = "paper_mse_gap_increased"
+    elif paper_baseline and not paper_gap_decision["gap_shrunk"]:
+        reason = "ms_aednet_gap_not_shrunk"
+    elif not paper_baseline and not (target_improved or mse_improved or diagnostic_improved):
         reason = "no_executable_improvement"
     else:
-        reason = "accepted_by_non_regression_harness"
+        reason = "accepted_by_counterfactual_gap_harness" if paper_baseline else "accepted_by_non_regression_harness"
+
+    accepted = reason.startswith("accepted_")
 
     return {
         "accepted": accepted,
@@ -627,6 +780,7 @@ def _accept_dispatch_candidate(
         "probe_deltas": probe_deltas,
         "improved_probes": improved_probes,
         "worsened_probes": worsened_probes,
+        "paper_gap_decision": paper_gap_decision,
     }
 
 
@@ -708,6 +862,546 @@ def _trajectory_evidence(
         "rejected_or_failed_attempts": rejected,
         "best_timeline_tail": best_timeline,
     }
+
+
+def _read_text_excerpt(path: str | Path | None, run_root: Path, max_chars: int) -> str:
+    if not path:
+        return ""
+    resolved = _resolve_stored_path(path, run_root)
+    if not resolved.exists():
+        return ""
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n...[truncated]\n"
+
+
+def _run_matches_harness(run_root: Path, hcfg: HarnessConfig) -> bool:
+    run_config_path = run_root / "run_config.json"
+    if not run_config_path.exists():
+        return False
+    try:
+        cfg = load_json(run_config_path).get("harness_config", {})
+    except Exception:
+        return False
+    return (
+        str(cfg.get("data_name", "")).upper() == str(hcfg.data_name).upper()
+        and int(cfg.get("seq_len", -1)) == int(hcfg.seq_len)
+        and int(cfg.get("pred_len", -1)) == int(hcfg.pred_len)
+    )
+
+
+def _expand_motif_source_path(path: Path, hcfg: HarnessConfig) -> list[Path]:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = (PROJECT_ROOT / path).resolve()
+    if not path.exists():
+        return []
+    if (path / "run_config.json").exists() and (path / "task_graph.json").exists():
+        return [path]
+    combo = f"{str(hcfg.data_name).upper()}_L{int(hcfg.seq_len)}_P{int(hcfg.pred_len)}"
+    combo_dir = path / combo
+    if (combo_dir / "run_config.json").exists() and (combo_dir / "task_graph.json").exists():
+        return [combo_dir]
+    return [
+        child
+        for child in sorted(path.iterdir())
+        if child.is_dir()
+        and child.name == combo
+        and (child / "run_config.json").exists()
+        and (child / "task_graph.json").exists()
+    ]
+
+
+def _default_motif_sources(run_root: Path, hcfg: HarnessConfig) -> list[Path]:
+    return [run_root.resolve()] if _run_matches_harness(run_root, hcfg) else []
+
+
+def _matching_run_motif_sources(run_root: Path, hcfg: HarnessConfig) -> list[Path]:
+    combo = f"{str(hcfg.data_name).upper()}_L{int(hcfg.seq_len)}_P{int(hcfg.pred_len)}"
+    sources = [run_root]
+    for sweep_root in sorted(RUNS_DIR.glob("pilot_trust*")):
+        candidate = sweep_root / combo
+        if candidate.exists():
+            sources.append(candidate)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for source in sources:
+        key = str(source.resolve())
+        if key not in seen and _run_matches_harness(source, hcfg):
+            unique.append(source.resolve())
+            seen.add(key)
+    return unique
+
+
+def _motif_sources(
+    run_root: Path,
+    hcfg: HarnessConfig,
+    requested_sources: list[str] | None,
+    evidence_scope: str = "current-run",
+) -> list[Path]:
+    if evidence_scope == "current-run":
+        return _default_motif_sources(run_root, hcfg)
+    if evidence_scope == "matching-runs" and not requested_sources:
+        return _matching_run_motif_sources(run_root, hcfg)
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for raw in requested_sources or []:
+        for root in _expand_motif_source_path(Path(raw), hcfg):
+            key = str(root.resolve())
+            if key not in seen and _run_matches_harness(root, hcfg):
+                roots.append(root.resolve())
+                seen.add(key)
+    if evidence_scope == "matching-runs" and str(run_root.resolve()) not in seen and _run_matches_harness(run_root, hcfg):
+        roots.insert(0, run_root.resolve())
+    return roots
+
+
+def _readonly_history_rows(run_root: Path, state: dict[str, Any], target_metric: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key in sorted(state.get("iterations", {})):
+        record = state["iterations"][key]
+        result_path = record.get("artifacts", {}).get("result", {}).get("path")
+        if not result_path:
+            continue
+        resolved_result_path = _resolve_stored_path(result_path, run_root)
+        if not resolved_result_path.exists():
+            continue
+        result = load_json(resolved_result_path)
+        route = record.get("route", {})
+        route_path = record.get("artifacts", {}).get("routing", {}).get("path")
+        if route_path:
+            resolved_route_path = _resolve_stored_path(route_path, run_root)
+            if resolved_route_path.exists():
+                route = load_json(resolved_route_path)
+        target = result.get("metrics", {}).get("target", {}) if result.get("success") else {}
+        rows.append(
+            {
+                "iteration": int(record.get("iteration", key.split("_")[-1])),
+                "success": result.get("success"),
+                "target": target,
+                "target_metric_value": target.get(target_metric),
+                "primary_component": route.get("primary_component"),
+                "active_components": route.get("active_components"),
+                "run_dir": result.get("run_dir"),
+                "result": result,
+                "route": route,
+            }
+        )
+    return rows
+
+
+def _mine_motifs_from_run(
+    source_root: Path,
+    hcfg: HarnessConfig,
+    target_metric: str,
+    max_diff_chars: int,
+) -> list[dict[str, Any]]:
+    if not _run_matches_harness(source_root, hcfg):
+        return []
+    graph_path = source_root / "task_graph.json"
+    if not graph_path.exists():
+        return []
+    state = load_json(graph_path)
+    history = _readonly_history_rows(source_root, state, target_metric)
+    rows_by_iter = {int(row["iteration"]): row for row in history}
+    motifs: list[dict[str, Any]] = []
+    for outcome_iteration, outcome_row in sorted(rows_by_iter.items()):
+        if outcome_iteration <= 0:
+            continue
+        patch_iteration = outcome_iteration - 1
+        patch_record = state.get("iterations", {}).get(f"iter_{patch_iteration:03d}", {}).get("patch", {})
+        if not patch_record or patch_record.get("validation_fallback"):
+            continue
+        parent_iteration = patch_record.get("parent_iteration")
+        parent_row = rows_by_iter.get(int(parent_iteration)) if parent_iteration is not None else rows_by_iter.get(patch_iteration)
+        if not parent_row:
+            continue
+        parent_result = parent_row.get("result", {})
+        outcome_result = outcome_row.get("result", {})
+        if not parent_result.get("success") or not outcome_result.get("success"):
+            continue
+
+        parent_target = _target_metric_value(parent_result, target_metric)
+        outcome_target = _target_metric_value(outcome_result, target_metric)
+        parent_mse = _inverse_mse_value(parent_result)
+        outcome_mse = _inverse_mse_value(outcome_result)
+        parent_paper_mae = _paper_mae_value(parent_result)
+        outcome_paper_mae = _paper_mae_value(outcome_result)
+        parent_paper_mse = _paper_mse_value(parent_result)
+        outcome_paper_mse = _paper_mse_value(outcome_result)
+
+        target_delta = _relative_improvement(parent_target, outcome_target)
+        mse_delta = _relative_improvement(parent_mse, outcome_mse)
+        paper_mae_delta = _finite_delta(parent_paper_mae, outcome_paper_mae)
+        paper_mse_delta = _finite_delta(parent_paper_mse, outcome_paper_mse)
+        improved = target_delta > 0 or mse_delta > 0 or paper_mae_delta > 0 or paper_mse_delta > 0
+        catastrophic_tradeoff = (
+            math.isfinite(outcome_paper_mae)
+            and math.isfinite(parent_paper_mae)
+            and outcome_paper_mae > parent_paper_mae * 1.01
+        ) or (
+            math.isfinite(outcome_paper_mse)
+            and math.isfinite(parent_paper_mse)
+            and outcome_paper_mse > parent_paper_mse * 1.03
+        )
+        if not improved or catastrophic_tradeoff:
+            continue
+
+        score = (
+            max(0.0, target_delta)
+            + 0.5 * max(0.0, mse_delta)
+            + 0.05 * max(0.0, paper_mae_delta)
+            + 0.01 * max(0.0, paper_mse_delta)
+        )
+        motif_id = (
+            f"{source_root.name}:patch_{patch_iteration:03d}_to_iter_{outcome_iteration:03d}:"
+            f"{patch_record.get('component') or 'unknown'}:{patch_record.get('edit_action') or 'unknown'}"
+        )
+        motifs.append(
+            {
+                "motif_id": motif_id,
+                "source_run_root": str(source_root),
+                "patch_iteration": patch_iteration,
+                "outcome_iteration": outcome_iteration,
+                "parent_iteration": parent_iteration,
+                "component": patch_record.get("component"),
+                "edit_action": patch_record.get("edit_action"),
+                "summary": patch_record.get("summary"),
+                "origin": patch_record.get("origin"),
+                "routed_component": patch_record.get("routed_component"),
+                "selected_edit": patch_record.get("selected_edit"),
+                "score": score,
+                "metric_delta": {
+                    "target_relative": target_delta,
+                    "mse_relative": mse_delta,
+                    "paper_mae": paper_mae_delta,
+                    "paper_mse": paper_mse_delta,
+                },
+                "parent_metrics": _paper_metric_summary(parent_result),
+                "outcome_metrics": _paper_metric_summary(outcome_result),
+                "diff_excerpt": _read_text_excerpt(patch_record.get("diff_path"), source_root, max_diff_chars),
+            }
+        )
+    return motifs
+
+
+def _mine_dispatch_motifs(
+    run_root: Path,
+    hcfg: HarnessConfig,
+    target_metric: str,
+    requested_sources: list[str] | None,
+    evidence_scope: str,
+    evidence_limit: int,
+    max_diff_chars: int,
+) -> dict[str, Any]:
+    roots = _motif_sources(run_root, hcfg, requested_sources, evidence_scope=evidence_scope)
+    motifs: list[dict[str, Any]] = []
+    for root in roots:
+        motifs.extend(_mine_motifs_from_run(root, hcfg, target_metric, max_diff_chars))
+    motifs = sorted(motifs, key=lambda row: row.get("score", 0.0), reverse=True)
+    return {
+        "sources": [str(root) for root in roots],
+        "motifs": motifs[: max(1, int(evidence_limit))],
+        "total_mined": len(motifs),
+    }
+
+
+def _source_hash(source: str) -> str:
+    import hashlib
+
+    return hashlib.md5(source.strip().encode("utf-8")).hexdigest()
+
+
+def _mine_archive_model_candidates(
+    run_root: Path,
+    hcfg: HarnessConfig,
+    target_metric: str,
+    requested_sources: list[str] | None,
+    evidence_scope: str,
+    limit: int,
+    protected_source: str,
+) -> dict[str, Any]:
+    roots = _motif_sources(run_root, hcfg, requested_sources, evidence_scope=evidence_scope)
+    protected_hash = _source_hash(protected_source)
+    seen_hashes = {protected_hash}
+    candidates: list[dict[str, Any]] = []
+    for root in roots:
+        graph_path = root / "task_graph.json"
+        if not graph_path.exists():
+            continue
+        state = load_json(graph_path)
+        history = _readonly_history_rows(root, state, target_metric)
+        for row in history:
+            result = row.get("result", {})
+            if not result.get("success"):
+                continue
+            try:
+                model_path = _iteration_source_path(row, root)
+                if not model_path.exists():
+                    continue
+                source = read_model_source(model_path)
+                source_hash = _source_hash(source)
+            except Exception:
+                continue
+            if source_hash in seen_hashes:
+                continue
+            seen_hashes.add(source_hash)
+            candidates.append(
+                {
+                    "archive_id": f"{root.name}:iter_{int(row['iteration']):03d}",
+                    "source_run_root": str(root),
+                    "iteration": int(row["iteration"]),
+                    "model_path": str(model_path),
+                    "source_hash": source_hash,
+                    "metrics": _paper_metric_summary(result),
+                    "paper_mae": _paper_mae_value(result),
+                    "paper_mse": _paper_mse_value(result),
+                    "target_metric_value": _target_metric_value(result, target_metric),
+                }
+            )
+    candidates = sorted(candidates, key=lambda row: (row["paper_mae"], row["paper_mse"], row["target_metric_value"]))
+    return {
+        "sources": [str(root) for root in roots],
+        "total_mined": len(candidates),
+        "candidates": candidates[: max(0, int(limit))],
+    }
+
+
+def _compact_patch_meta(patch_meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(patch_meta, dict):
+        return patch_meta
+    return {
+        key: value
+        for key, value in patch_meta.items()
+        if key not in {"raw_response"}
+    }
+
+
+def _candidate_selection_key(row: dict[str, Any]) -> tuple[float, float, float]:
+    decision = row.get("decision", {})
+    paper_gap = decision.get("paper_gap_decision", {})
+    candidate_gap = paper_gap.get("candidate_gap", {}) if isinstance(paper_gap, dict) else {}
+    result = row.get("result", {})
+    return (
+        _safe_metric(candidate_gap.get("total"), float("inf")),
+        _paper_mae_value(result),
+        _paper_mse_value(result),
+    )
+
+
+def _meaningful_code_line(line: str) -> bool:
+    text = line.strip()
+    if not text:
+        return False
+    if text.startswith("#"):
+        return False
+    if text.startswith(("import ", "from ")):
+        return False
+    if text in {'"""', "'''"}:
+        return False
+    return True
+
+
+def _self_names(lines: list[str]) -> set[str]:
+    names: set[str] = set()
+    for line in lines:
+        names.update(re.findall(r"\bself\.([A-Za-z_]\w*)", line))
+    return names
+
+
+def _dispatch_patch_quality(parent_source: str, candidate_source: str) -> dict[str, Any]:
+    diff_lines = list(
+        difflib.unified_diff(
+            parent_source.splitlines(),
+            candidate_source.splitlines(),
+            lineterm="",
+        )
+    )
+    added = [
+        line[1:]
+        for line in diff_lines
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    removed = [
+        line[1:]
+        for line in diff_lines
+        if line.startswith("-") and not line.startswith("---")
+    ]
+    meaningful_added = [line for line in added if _meaningful_code_line(line)]
+    meaningful_removed = [line for line in removed if _meaningful_code_line(line)]
+    added_self = _self_names(meaningful_added)
+    removed_self = _self_names(meaningful_removed)
+    destructively_removed = sorted(removed_self - added_self)
+    total_meaningful = len(meaningful_added) + len(meaningful_removed)
+
+    if total_meaningful < 4 or len(meaningful_added) < 2:
+        reason = "motif_no_effect"
+        passed = False
+    elif len(destructively_removed) > 2:
+        reason = "destructive_motif_transplant"
+        passed = False
+    elif len(meaningful_removed) > max(20, len(meaningful_added) * 2):
+        reason = "motif_removes_too_much_parent_code"
+        passed = False
+    else:
+        reason = "motif_quality_passed"
+        passed = True
+
+    return {
+        "passed": passed,
+        "reason": reason,
+        "meaningful_added": len(meaningful_added),
+        "meaningful_removed": len(meaningful_removed),
+        "added_self_names": sorted(added_self),
+        "removed_self_names": sorted(removed_self),
+        "destructively_removed_self_names": destructively_removed,
+    }
+
+
+def _dispatch_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "dispatch_mode", None) or "summary").strip().lower()
+    if mode not in {"summary", "candidates"}:
+        raise ValueError(f"Unsupported dispatch mode: {mode}")
+    return mode
+
+
+def _dispatch_candidate_limit(args: argparse.Namespace, dispatch_mode: str) -> int:
+    value = getattr(args, "dispatch_candidates", None)
+    if value is None:
+        return 0 if dispatch_mode == "summary" else 4
+    return max(0, int(value))
+
+
+def _archive_candidate_limit(args: argparse.Namespace, dispatch_mode: str) -> int:
+    if dispatch_mode == "summary":
+        return 0
+    return max(0, int(getattr(args, "archive_candidates", 0)))
+
+
+def _truncate_for_report(value: Any, max_chars: int = 1800) -> Any:
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + "\n...[truncated]\n"
+    return value
+
+
+def _compact_motif_for_report(motif: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "motif_id": motif.get("motif_id"),
+        "source_run_root": motif.get("source_run_root"),
+        "patch_iteration": motif.get("patch_iteration"),
+        "outcome_iteration": motif.get("outcome_iteration"),
+        "parent_iteration": motif.get("parent_iteration"),
+        "component": motif.get("component"),
+        "edit_action": motif.get("edit_action"),
+        "summary": motif.get("summary"),
+        "origin": motif.get("origin"),
+        "routed_component": motif.get("routed_component"),
+        "selected_edit": motif.get("selected_edit"),
+        "score": motif.get("score"),
+        "metric_delta": motif.get("metric_delta"),
+        "parent_metrics": motif.get("parent_metrics"),
+        "outcome_metrics": motif.get("outcome_metrics"),
+        "diff_excerpt": _truncate_for_report(motif.get("diff_excerpt", "")),
+    }
+
+
+def _compact_dispatch_report_payload(payload: dict[str, Any], max_motifs: int = 10) -> dict[str, Any]:
+    evidence = payload.get("trajectory_evidence") or {}
+    motif_library = payload.get("motif_library") or {}
+    motifs = motif_library.get("motifs") or []
+    return {
+        "dispatch_objective": payload.get("dispatch_objective"),
+        "dispatch_mode": "summary",
+        "protected_best": payload.get("protected_best"),
+        "paper_baseline": payload.get("paper_baseline"),
+        "evidence_scope": payload.get("evidence_scope"),
+        "trajectory_evidence": {
+            "accepted_improvements": (evidence.get("accepted_improvements") or [])[:8],
+            "rejected_or_failed_attempts": (evidence.get("rejected_or_failed_attempts") or [])[:8],
+            "best_timeline_tail": (evidence.get("best_timeline_tail") or [])[-12:],
+        },
+        "motif_library": {
+            "sources": motif_library.get("sources", []),
+            "total_mined": motif_library.get("total_mined", 0),
+            "motifs": [_compact_motif_for_report(motif) for motif in motifs[:max_motifs]],
+        },
+        "acceptance_policy": payload.get("acceptance_policy"),
+    }
+
+
+def _deterministic_dispatch_report(payload: dict[str, Any]) -> dict[str, Any]:
+    protected = payload.get("protected_best") or {}
+    protected_iteration = int(protected.get("iteration") or 0)
+    motif_library = payload.get("motif_library") or {}
+    evidence = payload.get("trajectory_evidence") or {}
+    motifs = motif_library.get("motifs") or []
+    supported = [
+        {
+            "motif_id": motif.get("motif_id"),
+            "component": motif.get("component"),
+            "edit_action": motif.get("edit_action"),
+            "evidence": {
+                "score": motif.get("score"),
+                "metric_delta": motif.get("metric_delta"),
+                "outcome_metrics": motif.get("outcome_metrics"),
+            },
+        }
+        for motif in motifs[:5]
+    ]
+    rejected = [
+        {
+            "component": row.get("component"),
+            "edit_action": row.get("edit_action"),
+            "reason": row.get("error_message") or "no executable improvement or validation fallback",
+            "target_delta_vs_parent": row.get("target_delta_vs_parent"),
+        }
+        for row in (evidence.get("rejected_or_failed_attempts") or [])[:5]
+    ]
+    return {
+        "schema": "forge.evidence_dispatch.report.v1",
+        "llm_used": False,
+        "summary": (
+            "Evidence Dispatch ran in summary-only mode. The final model remains the protected "
+            "Diagnostic Prober best; no new motif candidate was generated or evaluated."
+        ),
+        "protected_best_reason": (
+            f"Protected iter_{protected_iteration:03d} is the best executable model "
+            "selected by the fixed PEMFC harness."
+        ),
+        "supported_motifs": supported,
+        "negative_or_ambiguous_motifs": rejected,
+        "audit_trace": [
+            "diagnostic feedback -> routed component -> LLM/heuristic patch -> fixed-harness outcome",
+            "only executable improvements enter the motif evidence library",
+            "summary-only dispatch does not overwrite protected_best",
+        ],
+        "limitations": [
+            "Motif evidence is observational and run-specific.",
+            "No final counterfactual candidate is trained in summary-only mode.",
+        ],
+        "final_recommendation": "keep protected_best",
+    }
+
+
+def _merge_llm_dispatch_report(fallback: dict[str, Any], llm_report: dict[str, Any]) -> dict[str, Any]:
+    report = dict(fallback)
+    for key in (
+        "summary",
+        "protected_best_reason",
+        "supported_motifs",
+        "negative_or_ambiguous_motifs",
+        "audit_trace",
+        "limitations",
+        "final_recommendation",
+    ):
+        if key in llm_report:
+            report[key] = llm_report[key]
+    report["llm_used"] = True
+    report["llm_raw_response"] = {key: value for key, value in llm_report.items() if key != "_usage"}
+    if llm_report.get("_usage"):
+        report["llm_usage"] = llm_report["_usage"]
+    return report
 
 
 def _write_sweep_outputs(rows: list[dict[str, Any]], sweep_root: Path, target_metric: str) -> None:
@@ -937,6 +1631,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         orchestrator.finish_iteration(iteration)
 
     summary = _write_run_summary(run_root, rounds, target_metric, history)
+    dispatch_summary = _maybe_run_final_dispatch(args, run_root, target_metric)
+    if dispatch_summary:
+        summary["final_dispatch"] = _compact_dispatch_summary(dispatch_summary)
+        save_json(summary, run_root / "summary.json")
     print(f"[FORGE] Finished. Summary: {run_root / 'summary.json'}")
     return summary
 
@@ -1164,6 +1862,10 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
 
     summary = _write_run_summary(run_root, to_round, target_metric, history)
     refreshed_sweep = _maybe_refresh_parent_sweep_summary(run_root, target_metric)
+    dispatch_summary = _maybe_run_final_dispatch(args, run_root, target_metric)
+    if dispatch_summary:
+        summary["final_dispatch"] = _compact_dispatch_summary(dispatch_summary)
+        save_json(summary, run_root / "summary.json")
     orchestrator.event("continue_finished", {"to_round": to_round})
     orchestrator.save()
     print(f"[FORGE] Continue finished. Summary: {run_root / 'summary.json'}")
@@ -1183,105 +1885,35 @@ def _unique_child_dir(parent: Path, name: str) -> Path:
     raise RuntimeError(f"Could not allocate unique dispatch directory under {parent}")
 
 
-def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
-    ensure_project_dirs()
-    validate_harness_specs()
-    ensure_ms_aednet_data()
-
-    run_root, _exp_cfg, hcfg, target_metric, llm_mode = _load_continue_run(args)
-    orchestrator = GraphOrchestrator.open(run_root)
-    history = orchestrator.history_rows(target_metric)
-    _attach_saved_feedback_and_routes(orchestrator, history)
-    if not history:
-        raise RuntimeError(f"No completed iterations found in {run_root}")
-    protected_row = _best_history_row(history, target_metric)
-    if protected_row is None:
-        raise RuntimeError(f"No successful protected best model found in {run_root}")
-
-    protected_iteration = int(protected_row["iteration"])
-    protected_result = protected_row["result"]
-    protected_feedback = protected_row.get("feedback")
-    if not isinstance(protected_feedback, dict):
-        protected_feedback = _load_iteration_json(orchestrator, protected_iteration, "feedback_vector")
-    if not protected_feedback.get("pemfc_context"):
-        protected_feedback["pemfc_context"] = build_pemfc_context(
-            protected_feedback,
-            result=protected_result,
-            harness_config=hcfg,
-        )
-    protected_model_path = _iteration_source_path(protected_row, run_root)
-    protected_source = read_model_source(protected_model_path)
-
-    dispatch_dir = _unique_child_dir(run_root, args.dispatch_name or "evidence_dispatch")
-    protected_dir = dispatch_dir / "protected_best"
-    candidate_dir = dispatch_dir / "candidate"
-    final_dir = dispatch_dir / "final"
-    protected_dir.mkdir(parents=True, exist_ok=True)
+def _evaluate_dispatch_candidate(
+    *,
+    candidate_index: int,
+    candidate: PatchCandidate,
+    candidate_dir: Path,
+    protected_copy: Path,
+    protected_source: str,
+    protected_iteration: int,
+    protected_result: dict[str, Any],
+    protected_feedback: dict[str, Any],
+    protected_route: dict[str, Any],
+    history: list[dict[str, Any]],
+    hcfg: HarnessConfig,
+    target_metric: str,
+    target_diagnostics: list[str],
+    paper_baseline: dict[str, Any] | None,
+    llm_cfg: dict[str, Any] | None,
+    max_repair_rounds: int,
+    motif: dict[str, Any] | None,
+    min_relative_improvement: float,
+) -> dict[str, Any]:
     candidate_dir.mkdir(parents=True, exist_ok=True)
-    final_dir.mkdir(parents=True, exist_ok=True)
-    protected_copy = protected_dir / "model.py"
-    protected_copy.write_text(protected_source, encoding="utf-8")
-    save_json(protected_result, protected_dir / "result.json")
-    save_json(protected_feedback, protected_dir / "feedback_vector.json")
-
-    evidence = _trajectory_evidence(
-        orchestrator,
-        history,
-        target_metric,
-        protected_iteration,
-        limit=int(args.evidence_limit),
-    )
-    target_diagnostics = args.target_diagnostics or _dominant_diagnostics(protected_feedback)
-    payload = {
-        "dispatch_objective": "Generate one evidence-grounded final candidate on top of the protected best model.",
-        "protected_best": {
-            "iteration": protected_iteration,
-            "model_path": str(protected_model_path),
-            "metrics": _paper_metric_summary(protected_result),
-            "dominant_diagnostics": target_diagnostics,
-            "diagnostic_probes": _diagnostic_probe_map(protected_feedback),
-        },
-        "trajectory_evidence": evidence,
-        "acceptance_policy": {
-            "protected_best_is_default_final": True,
-            "candidate_must_pass_same_harness": True,
-            "candidate_must_not_regress_target_metric": target_metric,
-            "candidate_must_not_regress_inverse_mse": True,
-            "candidate_must_improve_target_or_mse_or_target_diagnostic": True,
-            "target_diagnostics": target_diagnostics,
-            "min_relative_improvement": float(args.min_relative_improvement),
-        },
-    }
-    save_json(payload, dispatch_dir / "dispatch_payload.json")
-
-    llm_cfg = None
-    candidate: PatchCandidate | None = None
-    if llm_mode in {"auto", "required"}:
-        try:
-            llm_cfg = load_llm_config(str(CONFIG_DIR / "forge_llm.yaml"))
-            candidate = request_llm_dispatch_patch(llm_cfg, protected_source, payload)
-        except Exception as exc:
-            if llm_mode == "required":
-                raise
-            print(f"[FORGE] Evidence dispatcher LLM unavailable, using protected-best no-op: {exc}")
-    if candidate is None:
-        candidate = PatchCandidate(
-            source=protected_source.strip() + "\n",
-            rationale="LLM dispatch disabled; reuse protected best model.",
-            summary="Reuses protected best model as dispatch candidate.",
-            component="protected_best",
-            origin="protected_best_noop",
-            edit_action="reuse_protected_best",
-            raw_response=None,
-        )
-
     validation_cfg = _validation_config(hcfg)
     feature_dim = get_feature_dim()
     candidate_model_path = candidate_dir / "model.py"
     repair_attempts: list[dict[str, Any]] = []
     patch_meta: dict[str, Any] | None = None
     validation_error: str | None = None
-    max_repair_rounds = int((llm_cfg or {}).get("max_repair_rounds", 2)) if llm_cfg else 0
+    quality_error: str | None = None
     attempt = 0
     while True:
         try:
@@ -1293,21 +1925,38 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 feature_dim=feature_dim,
                 artifact_dir=candidate_dir,
             )
+            validation_error = None
             patch_meta["repair_attempts"] = repair_attempts
             patch_meta["protected_iteration"] = protected_iteration
+            patch_meta["selected_motif_id"] = (motif or {}).get("motif_id")
+            if candidate.origin == "archive_model":
+                quality = {
+                    "passed": True,
+                    "reason": "archive_model_promotion",
+                    "meaningful_added": None,
+                    "meaningful_removed": None,
+                    "added_self_names": [],
+                    "removed_self_names": [],
+                    "destructively_removed_self_names": [],
+                }
+            else:
+                quality = _dispatch_patch_quality(protected_source, candidate.source)
+            patch_meta["motif_quality"] = quality
+            if not quality["passed"]:
+                quality_error = str(quality["reason"])
             save_json(patch_meta, candidate_dir / "patch_meta.json")
             break
         except Exception as exc:
             validation_error = f"{type(exc).__name__}: {exc}"
             repair_attempts.append(save_failed_candidate_attempt(candidate, candidate_dir, attempt, validation_error))
-            can_repair = llm_cfg is not None and candidate.origin in {"llm_dispatch", "llm_repair"} and attempt < max_repair_rounds
+            can_repair = llm_cfg is not None and candidate.origin in {"llm_dispatch", "llm_motif_dispatch", "llm_repair"} and attempt < max_repair_rounds
             if can_repair:
                 try:
                     candidate = request_llm_repair_patch(
                         llm_cfg,
                         protected_iteration,
                         protected_feedback,
-                        protected_row.get("route") or {},
+                        protected_route,
                         protected_source,
                         candidate,
                         validation_error,
@@ -1334,37 +1983,36 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 "edit_action": candidate.edit_action,
                 "validation_error": validation_error,
                 "repair_attempts": repair_attempts,
+                "selected_motif_id": (motif or {}).get("motif_id"),
             }
             save_json(patch_meta, candidate_dir / "patch_meta.json")
             break
 
-    candidate_result: dict[str, Any] | None = None
-    candidate_feedback: dict[str, Any] = {}
-    if candidate_model_path.exists() and validation_error is None:
-        print(f"[FORGE] Evidence Dispatch: evaluating candidate {candidate_model_path}")
-        candidate_result = run_harness(candidate_model_path, candidate_dir, hcfg)
-        save_json(candidate_result, candidate_dir / "result.json")
-        candidate_feedback = encode_feedback(
-            candidate_result,
+    if candidate_model_path.exists() and validation_error is None and quality_error is None:
+        print(f"[FORGE] Evidence Dispatch: evaluating candidate {candidate_index:02d} {candidate_model_path}")
+        result = run_harness(candidate_model_path, candidate_dir, hcfg)
+        save_json(result, candidate_dir / "result.json")
+        feedback = encode_feedback(
+            result,
             protected_result,
             protected_result,
             target_metric=target_metric,
         )
-        candidate_feedback["pemfc_context"] = build_pemfc_context(
-            candidate_feedback,
-            result=candidate_result,
+        feedback["pemfc_context"] = build_pemfc_context(
+            feedback,
+            result=result,
             harness_config=hcfg,
         )
-        save_json(candidate_feedback, candidate_dir / "feedback_vector.json")
+        save_json(feedback, candidate_dir / "feedback_vector.json")
     else:
-        candidate_result = {
+        result = {
             "success": False,
             "run_dir": str(candidate_dir),
             "model_path": str(candidate_model_path),
-            "error_type": "validation",
-            "error_message": validation_error or "candidate model was not produced",
+            "error_type": "motif_quality" if quality_error else "validation",
+            "error_message": quality_error or validation_error or "candidate model was not produced",
         }
-        candidate_feedback = {
+        feedback = {
             "diagnostics": [],
             "features": {"has_exception": 1.0},
             "target_metric": target_metric,
@@ -1372,48 +2020,469 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
     decision = _accept_dispatch_candidate(
         protected_result,
-        candidate_result,
+        result,
         protected_feedback,
-        candidate_feedback,
+        feedback,
         target_metric,
         target_diagnostics=target_diagnostics,
-        min_relative_improvement=float(args.min_relative_improvement),
+        min_relative_improvement=min_relative_improvement,
+        paper_baseline=paper_baseline,
     )
-    selected = "candidate" if decision["accepted"] else "protected_best"
-    selected_model_path = candidate_model_path if decision["accepted"] else protected_copy
-    final_model_path = final_dir / "model.py"
-    shutil.copy2(selected_model_path, final_model_path)
-    final_result = candidate_result if decision["accepted"] else protected_result
-    save_json(final_result, final_dir / "selected_result.json")
+    row = {
+        "candidate_index": candidate_index,
+        "candidate_dir": str(candidate_dir),
+        "model_path": str(candidate_model_path),
+        "selected_motif": motif,
+        "patch_meta": _compact_patch_meta(patch_meta),
+        "success": bool(result.get("success")),
+        "result": result,
+        "feedback": feedback,
+        "decision": decision,
+    }
+    save_json(
+        {
+            "candidate_index": candidate_index,
+            "selected_motif": motif,
+            "patch_meta": _compact_patch_meta(patch_meta),
+            "success": bool(result.get("success")),
+            "metrics": _paper_metric_summary(result) if result.get("success") else {},
+            "error_type": result.get("error_type"),
+            "error_message": result.get("error_message"),
+            "decision": decision,
+        },
+        candidate_dir / "candidate_summary.json",
+    )
+    return row
 
-    summary = {
-        "schema": "forge.evidence_dispatch.v1",
-        "run_root": str(run_root),
-        "dispatch_dir": str(dispatch_dir),
-        "target_metric": target_metric,
+
+def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
+    ensure_project_dirs()
+    validate_harness_specs()
+    ensure_ms_aednet_data()
+
+    run_root, _exp_cfg, hcfg, target_metric, llm_mode = _load_continue_run(args)
+    orchestrator = GraphOrchestrator.open(run_root)
+    history = orchestrator.history_rows(target_metric)
+    _attach_saved_feedback_and_routes(orchestrator, history)
+    dispatch_mode = _dispatch_mode(args)
+    dispatch_candidate_limit = _dispatch_candidate_limit(args, dispatch_mode)
+    archive_candidate_limit = _archive_candidate_limit(args, dispatch_mode)
+    if not history:
+        raise RuntimeError(f"No completed iterations found in {run_root}")
+    protected_row = _best_history_row(history, target_metric)
+    if protected_row is None:
+        raise RuntimeError(f"No successful protected best model found in {run_root}")
+
+    protected_iteration = int(protected_row["iteration"])
+    protected_result = protected_row["result"]
+    protected_feedback = protected_row.get("feedback")
+    if not isinstance(protected_feedback, dict):
+        protected_feedback = _load_iteration_json(orchestrator, protected_iteration, "feedback_vector")
+    if not protected_feedback.get("pemfc_context"):
+        protected_feedback["pemfc_context"] = build_pemfc_context(
+            protected_feedback,
+            result=protected_result,
+            harness_config=hcfg,
+        )
+    protected_model_path = _iteration_source_path(protected_row, run_root)
+    protected_source = read_model_source(protected_model_path)
+
+    dispatch_dir = _unique_child_dir(run_root, args.dispatch_name or "evidence_dispatch")
+    protected_dir = dispatch_dir / "protected_best"
+    candidates_dir = dispatch_dir / "candidates"
+    final_dir = dispatch_dir / "final"
+    protected_dir.mkdir(parents=True, exist_ok=True)
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    protected_copy = protected_dir / "model.py"
+    protected_copy.write_text(protected_source, encoding="utf-8")
+    save_json(protected_result, protected_dir / "result.json")
+    save_json(protected_feedback, protected_dir / "feedback_vector.json")
+
+    evidence = _trajectory_evidence(
+        orchestrator,
+        history,
+        target_metric,
+        protected_iteration,
+        limit=int(args.evidence_limit),
+    )
+    target_diagnostics = args.target_diagnostics or _dominant_diagnostics(protected_feedback)
+    paper_baseline = _load_paper_baseline(
+        hcfg,
+        method=str(args.paper_baseline_method),
+        override_mae=args.paper_baseline_mae,
+        override_mse=args.paper_baseline_mse,
+    )
+    motif_library = _mine_dispatch_motifs(
+        run_root,
+        hcfg,
+        target_metric,
+        args.motif_sources,
+        evidence_scope=str(args.evidence_scope),
+        evidence_limit=int(args.evidence_limit),
+        max_diff_chars=int(args.motif_diff_chars),
+    )
+    if dispatch_mode == "candidates":
+        archive_library = _mine_archive_model_candidates(
+            run_root,
+            hcfg,
+            target_metric,
+            args.motif_sources,
+            evidence_scope=str(args.evidence_scope),
+            limit=archive_candidate_limit,
+            protected_source=protected_source,
+        )
+    else:
+        archive_library = {
+            "sources": motif_library["sources"],
+            "total_mined": 0,
+            "candidates": [],
+        }
+    payload = {
+        "dispatch_objective": (
+            "Summarize current-run PEMFC refinement evidence and keep the protected best "
+            "model as the final artifact."
+            if dispatch_mode == "summary"
+            else (
+                "Counterfactually transplant one historically successful PEMFC patch motif "
+                "onto the protected best model. The candidate is accepted only if the fixed "
+                "harness shrinks the paper-scale MAE/MSE gap to the Ms-AeDNet target."
+            )
+        ),
+        "dispatch_mode": dispatch_mode,
         "protected_best": {
             "iteration": protected_iteration,
             "model_path": str(protected_model_path),
             "metrics": _paper_metric_summary(protected_result),
+            "dominant_diagnostics": target_diagnostics,
+            "diagnostic_probes": _diagnostic_probe_map(protected_feedback),
         },
-        "candidate": {
-            "model_path": str(candidate_model_path),
-            "patch_meta": patch_meta,
-            "success": bool(candidate_result.get("success")),
-            "metrics": _paper_metric_summary(candidate_result) if candidate_result.get("success") else {},
-            "error_type": candidate_result.get("error_type"),
-            "error_message": candidate_result.get("error_message"),
+        "paper_baseline": paper_baseline,
+        "evidence_scope": str(args.evidence_scope),
+        "trajectory_evidence": evidence,
+        "motif_library": motif_library,
+        "archive_model_library": archive_library,
+        "acceptance_policy": {
+            "protected_best_is_default_final": True,
+            "summary_only_no_candidate_training": dispatch_mode == "summary",
+            "candidate_must_pass_same_harness": True,
+            "candidate_must_not_regress_target_metric": target_metric,
+            "candidate_must_not_regress_inverse_mse": True,
+            "candidate_must_shrink_ms_aednet_paper_mae_mse_gap": bool(paper_baseline),
+            "candidate_must_improve_target_or_mse_or_target_diagnostic_without_paper_baseline": not bool(paper_baseline),
+            "target_diagnostics": target_diagnostics,
+            "min_relative_improvement": float(args.min_relative_improvement),
         },
-        "decision": decision,
+    }
+    save_json(payload, dispatch_dir / "dispatch_payload.json")
+
+    llm_cfg = None
+    if llm_mode in {"auto", "required"}:
+        try:
+            llm_cfg = load_llm_config(str(CONFIG_DIR / "forge_llm.yaml"))
+        except Exception as exc:
+            if llm_mode == "required":
+                raise
+            print(f"[FORGE] Evidence dispatcher LLM unavailable; no motif candidates will be generated: {exc}")
+    max_repair_rounds = int((llm_cfg or {}).get("max_repair_rounds", 2)) if llm_cfg else 0
+
+    print(f"[FORGE] Evidence Dispatch mode: {dispatch_mode}")
+    print(f"[FORGE] Evidence Dispatch motif sources: {len(motif_library['sources'])}")
+    print(f"[FORGE] Evidence Dispatch motifs mined: {motif_library['total_mined']}")
+    if dispatch_mode == "candidates":
+        print(f"[FORGE] Evidence Dispatch archive models mined: {archive_library['total_mined']}")
+    if paper_baseline:
+        print(
+            "[FORGE] Ms-AeDNet paper target: "
+            f"{paper_baseline['dataset']} L{paper_baseline['seq_len']} P{paper_baseline['pred_len']} "
+            f"MAE={paper_baseline['mae']} MSE={paper_baseline['mse']}"
+        )
+    else:
+        print("[FORGE] No Ms-AeDNet paper target found; falling back to protected non-regression acceptance.")
+
+    if dispatch_mode == "summary":
+        report_payload = _compact_dispatch_report_payload(payload)
+        report = _deterministic_dispatch_report(report_payload)
+        if llm_cfg is not None:
+            try:
+                llm_report = request_llm_dispatch_summary(llm_cfg, report_payload)
+                report = _merge_llm_dispatch_report(report, llm_report)
+            except Exception as exc:
+                if llm_mode == "required":
+                    raise
+                report["llm_error"] = f"{type(exc).__name__}: {exc}"
+        save_json(report, dispatch_dir / "dispatch_report.json")
+
+        final_model_path = final_dir / "model.py"
+        shutil.copy2(protected_copy, final_model_path)
+        save_json(protected_result, final_dir / "selected_result.json")
+
+        motifs_for_report = report_payload["motif_library"]["motifs"]
+        summary = {
+            "schema": "forge.evidence_dispatch.summary.v1",
+            "run_root": str(run_root),
+            "dispatch_dir": str(dispatch_dir),
+            "dispatch_mode": dispatch_mode,
+            "target_metric": target_metric,
+            "evidence_scope": str(args.evidence_scope),
+            "paper_baseline": paper_baseline,
+            "protected_best": {
+                "iteration": protected_iteration,
+                "model_path": str(protected_model_path),
+                "metrics": _paper_metric_summary(protected_result),
+                "paper_gap": _paper_positive_gap(protected_result, paper_baseline),
+            },
+            "motif_library": {
+                "sources": motif_library["sources"],
+                "total_mined": motif_library["total_mined"],
+                "used_count": len(motifs_for_report),
+                "motifs": motifs_for_report,
+            },
+            "archive_model_library": {
+                "sources": archive_library["sources"],
+                "total_mined": archive_library["total_mined"],
+                "used_count": 0,
+                "candidates": [],
+            },
+            "candidates": [],
+            "accepted_count": 0,
+            "selected": "protected_best",
+            "selected_candidate_index": None,
+            "final_model_path": str(final_model_path),
+            "dispatch_report_path": str(dispatch_dir / "dispatch_report.json"),
+            "dispatch_report": report,
+            "non_regression_guarantee": (
+                "summary-only Evidence Dispatch never generates or adopts a new candidate; "
+                "final_model is a copy of the protected best Diagnostic Prober model."
+            ),
+        }
+        save_json(summary, dispatch_dir / "dispatch_summary.json")
+        print("[FORGE] Evidence Dispatch summary-only: protected_best remains final")
+        print(f"[FORGE] Dispatch report: {dispatch_dir / 'dispatch_report.json'}")
+        print(f"[FORGE] Dispatch summary: {dispatch_dir / 'dispatch_summary.json'}")
+        print(f"[FORGE] Final model: {final_model_path}")
+        return summary
+
+    candidate_records: list[dict[str, Any]] = []
+    next_candidate_index = 0
+    for archive in archive_library["candidates"]:
+        archive_source = read_model_source(_resolve_stored_path(archive["model_path"], run_root))
+        archive_candidate = PatchCandidate(
+            source=archive_source,
+            rationale="Historical same-harness model achieved stronger executable metrics; verify as an archive promotion candidate.",
+            summary=f"Promote historical model {archive['archive_id']} as a fixed-harness candidate.",
+            component="archive_model",
+            origin="archive_model",
+            edit_action="promote_historical_best_model",
+            raw_response={"archive_model": archive},
+        )
+        archive_motif = {
+            "motif_id": archive["archive_id"],
+            "type": "archive_model_promotion",
+            "source_run_root": archive["source_run_root"],
+            "iteration": archive["iteration"],
+            "model_path": archive["model_path"],
+            "metrics": archive["metrics"],
+        }
+        candidate_records.append(
+            _evaluate_dispatch_candidate(
+                candidate_index=next_candidate_index,
+                candidate=archive_candidate,
+                candidate_dir=candidates_dir / f"candidate_{next_candidate_index:02d}_archive",
+                protected_copy=protected_copy,
+                protected_source=protected_source,
+                protected_iteration=protected_iteration,
+                protected_result=protected_result,
+                protected_feedback=protected_feedback,
+                protected_route=protected_row.get("route") or {},
+                history=history,
+                hcfg=hcfg,
+                target_metric=target_metric,
+                target_diagnostics=target_diagnostics,
+                paper_baseline=paper_baseline,
+                llm_cfg=llm_cfg,
+                max_repair_rounds=0,
+                motif=archive_motif,
+                min_relative_improvement=float(args.min_relative_improvement),
+            )
+        )
+        next_candidate_index += 1
+
+    motifs = motif_library["motifs"][:dispatch_candidate_limit]
+    if llm_cfg is None or not motifs:
+        if llm_mode == "required" and not motifs and not candidate_records:
+            raise RuntimeError("Evidence Dispatch required LLM candidates, but no successful motifs were mined")
+    else:
+        for motif in motifs:
+            index = next_candidate_index
+            candidate_payload = {
+                **payload,
+                "selected_motif": motif,
+                "candidate_index": index,
+                "candidate_count": len(motifs),
+            }
+            try:
+                candidate = request_llm_dispatch_patch(llm_cfg, protected_source, candidate_payload)
+                candidate.origin = "llm_motif_dispatch"
+                if candidate.raw_response is None:
+                    candidate.raw_response = {}
+                candidate.raw_response["selected_motif_id"] = motif.get("motif_id")
+            except Exception as exc:
+                if llm_mode == "required":
+                    raise
+                candidate_records.append(
+                    {
+                        "candidate_index": index,
+                        "selected_motif": motif,
+                        "success": False,
+                        "error_type": "llm_dispatch",
+                        "error_message": f"{type(exc).__name__}: {exc}",
+                        "decision": {"accepted": False, "reason": "llm_dispatch_failed"},
+                    }
+                )
+                continue
+
+            candidate_records.append(
+                _evaluate_dispatch_candidate(
+                    candidate_index=index,
+                    candidate=candidate,
+                    candidate_dir=candidates_dir / f"candidate_{index:02d}",
+                    protected_copy=protected_copy,
+                    protected_source=protected_source,
+                    protected_iteration=protected_iteration,
+                    protected_result=protected_result,
+                    protected_feedback=protected_feedback,
+                    protected_route=protected_row.get("route") or {},
+                    history=history,
+                    hcfg=hcfg,
+                    target_metric=target_metric,
+                    target_diagnostics=target_diagnostics,
+                    paper_baseline=paper_baseline,
+                    llm_cfg=llm_cfg,
+                    max_repair_rounds=max_repair_rounds,
+                    motif=motif,
+                    min_relative_improvement=float(args.min_relative_improvement),
+                )
+            )
+            next_candidate_index += 1
+
+    accepted_records = [row for row in candidate_records if row.get("decision", {}).get("accepted")]
+    selected_record = min(accepted_records, key=_candidate_selection_key) if accepted_records else None
+    selected = "candidate" if selected_record else "protected_best"
+    selected_model_path = Path(selected_record["model_path"]) if selected_record else protected_copy
+    final_model_path = final_dir / "model.py"
+    shutil.copy2(selected_model_path, final_model_path)
+    final_result = selected_record["result"] if selected_record else protected_result
+    save_json(final_result, final_dir / "selected_result.json")
+
+    compact_candidates = [
+        {
+            "candidate_index": row.get("candidate_index"),
+            "candidate_dir": row.get("candidate_dir"),
+            "model_path": row.get("model_path"),
+            "selected_motif_id": (row.get("selected_motif") or {}).get("motif_id"),
+            "selected_motif": row.get("selected_motif"),
+            "patch_meta": row.get("patch_meta"),
+            "success": bool(row.get("success")),
+            "metrics": _paper_metric_summary(row.get("result", {})) if row.get("success") else {},
+            "error_type": row.get("result", {}).get("error_type") if isinstance(row.get("result"), dict) else row.get("error_type"),
+            "error_message": row.get("result", {}).get("error_message") if isinstance(row.get("result"), dict) else row.get("error_message"),
+            "decision": row.get("decision"),
+        }
+        for row in candidate_records
+    ]
+    summary = {
+        "schema": "forge.evidence_dispatch.v2",
+        "run_root": str(run_root),
+        "dispatch_dir": str(dispatch_dir),
+        "dispatch_mode": dispatch_mode,
+        "target_metric": target_metric,
+        "evidence_scope": str(args.evidence_scope),
+        "paper_baseline": paper_baseline,
+        "protected_best": {
+            "iteration": protected_iteration,
+            "model_path": str(protected_model_path),
+            "metrics": _paper_metric_summary(protected_result),
+            "paper_gap": _paper_positive_gap(protected_result, paper_baseline),
+        },
+        "motif_library": {
+            "sources": motif_library["sources"],
+            "total_mined": motif_library["total_mined"],
+            "used_count": len(motifs),
+            "motifs": motifs,
+        },
+        "archive_model_library": {
+            "sources": archive_library["sources"],
+            "total_mined": archive_library["total_mined"],
+            "used_count": len(archive_library["candidates"]),
+            "candidates": archive_library["candidates"],
+        },
+        "candidates": compact_candidates,
+        "accepted_count": len(accepted_records),
         "selected": selected,
+        "selected_candidate_index": selected_record.get("candidate_index") if selected_record else None,
         "final_model_path": str(final_model_path),
-        "non_regression_guarantee": "final_model is candidate only if accepted by fixed harness; otherwise protected_best is copied.",
+        "non_regression_guarantee": (
+            "final_model is a motif candidate only if it passes the fixed harness and shrinks the "
+            "paper-scale MAE/MSE gap to the configured Ms-AeDNet target; otherwise protected_best is copied."
+        ),
     }
     save_json(summary, dispatch_dir / "dispatch_summary.json")
     print(f"[FORGE] Evidence Dispatch selected: {selected}")
+    print(f"[FORGE] Accepted motif candidates: {len(accepted_records)} / {len(candidate_records)}")
     print(f"[FORGE] Dispatch summary: {dispatch_dir / 'dispatch_summary.json'}")
     print(f"[FORGE] Final model: {final_model_path}")
     return summary
+
+
+def _compact_dispatch_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": summary.get("schema"),
+        "dispatch_dir": summary.get("dispatch_dir"),
+        "dispatch_mode": summary.get("dispatch_mode"),
+        "evidence_scope": summary.get("evidence_scope"),
+        "selected": summary.get("selected"),
+        "accepted_count": summary.get("accepted_count"),
+        "selected_candidate_index": summary.get("selected_candidate_index"),
+        "final_model_path": summary.get("final_model_path"),
+        "dispatch_report_path": summary.get("dispatch_report_path"),
+        "protected_best": summary.get("protected_best"),
+    }
+
+
+def _maybe_run_final_dispatch(args: argparse.Namespace, run_root: Path, target_metric: str) -> dict[str, Any] | None:
+    if not bool(getattr(args, "final_dispatch", False)):
+        return None
+    dispatch_llm_mode = getattr(args, "dispatch_llm_mode", None) or getattr(args, "llm_mode", None) or "required"
+    dispatch_mode = str(getattr(args, "dispatch_mode", None) or "summary")
+    dispatch_args = argparse.Namespace(
+        experiment_config=getattr(args, "experiment_config", str(CONFIG_DIR / "forge_experiment.yaml")),
+        run_dir=str(run_root),
+        dispatch_name=getattr(args, "dispatch_name", None) or "evidence_dispatch_summary",
+        llm_mode=dispatch_llm_mode,
+        dispatch_mode=dispatch_mode,
+        target_metric=target_metric,
+        target_diagnostics=None,
+        evidence_limit=int(getattr(args, "evidence_limit", 16)),
+        dispatch_candidates=getattr(args, "dispatch_candidates", None),
+        archive_candidates=int(getattr(args, "archive_candidates", 0)),
+        evidence_scope="current-run",
+        motif_sources=None,
+        motif_diff_chars=int(getattr(args, "motif_diff_chars", 12000)),
+        paper_baseline_method=getattr(args, "paper_baseline_method", "Ms-AeDNet"),
+        paper_baseline_mae=getattr(args, "paper_baseline_mae", None),
+        paper_baseline_mse=getattr(args, "paper_baseline_mse", None),
+        min_relative_improvement=float(getattr(args, "min_relative_improvement", 0.0)),
+        epochs=getattr(args, "epochs", None),
+        batch_size=getattr(args, "batch_size", None),
+        lr=getattr(args, "lr", None),
+        patience=getattr(args, "patience", None),
+        seed=getattr(args, "seed", None),
+        device=getattr(args, "device", None),
+        cuda_id=getattr(args, "cuda_id", None),
+    )
+    print(f"[FORGE] Final Evidence Dispatch: current-run-only {dispatch_mode} evidence")
+    return cmd_dispatch(dispatch_args)
 
 
 def cmd_sweep(args: argparse.Namespace) -> None:
@@ -1469,6 +2538,8 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     row["success"] = True
                     row["best_target"] = summary.get("best_target")
                     row["best_run_dir"] = summary.get("best_run_dir")
+                    if summary.get("final_dispatch"):
+                        row["final_dispatch"] = summary.get("final_dispatch")
                 except Exception as exc:
                     row["error"] = f"{type(exc).__name__}: {exc}"
                     print(f"[FORGE] Sweep combo failed: {combo_name}: {row['error']}")
@@ -1492,6 +2563,21 @@ def cmd_summarize_sweep(args: argparse.Namespace) -> None:
 
     _refresh_sweep_summary(sweep_root, target_metric)
     print(f"[FORGE] Sweep summary refreshed: {sweep_root / 'sweep_summary.json'}")
+
+
+def _add_final_dispatch_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--final-dispatch", action="store_true", help="run current-run-only evidence summary after iterations")
+    parser.add_argument("--dispatch-name", default="evidence_dispatch_summary")
+    parser.add_argument("--dispatch-llm-mode", choices=["auto", "off", "required"], default=None)
+    parser.add_argument("--dispatch-mode", choices=["summary", "candidates"], default="summary")
+    parser.add_argument("--dispatch-candidates", type=int, default=None)
+    parser.add_argument("--archive-candidates", type=int, default=0)
+    parser.add_argument("--evidence-limit", type=int, default=16)
+    parser.add_argument("--motif-diff-chars", type=int, default=12000)
+    parser.add_argument("--paper-baseline-method", default="Ms-AeDNet")
+    parser.add_argument("--paper-baseline-mae", type=float, default=None)
+    parser.add_argument("--paper-baseline-mse", type=float, default=None)
+    parser.add_argument("--min-relative-improvement", type=float, default=0.0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1526,6 +2612,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--hidden-dim", type=int, default=None)
     run_p.add_argument("--layer", type=int, default=None)
     run_p.add_argument("--dropout", type=float, default=None)
+    _add_final_dispatch_args(run_p)
     run_p.set_defaults(func=cmd_run)
 
     continue_p = sub.add_parser("continue", help="continue an existing run from its last completed iteration")
@@ -1549,16 +2636,30 @@ def build_parser() -> argparse.ArgumentParser:
     continue_p.add_argument("--seed", type=int, default=None)
     continue_p.add_argument("--device", choices=["cuda", "cpu", "auto"], default=None)
     continue_p.add_argument("--cuda-id", type=int, default=None)
+    _add_final_dispatch_args(continue_p)
     continue_p.set_defaults(func=cmd_continue)
 
     dispatch_p = sub.add_parser("dispatch", help="run protected Evidence Dispatch over a completed run")
     dispatch_p.add_argument("--experiment-config", default=str(CONFIG_DIR / "forge_experiment.yaml"))
     dispatch_p.add_argument("--run-dir", required=True)
-    dispatch_p.add_argument("--dispatch-name", default="evidence_dispatch")
+    dispatch_p.add_argument("--dispatch-name", default="evidence_dispatch_summary")
     dispatch_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default="required")
+    dispatch_p.add_argument("--dispatch-mode", choices=["summary", "candidates"], default="summary")
     dispatch_p.add_argument("--target-metric", default=None)
     dispatch_p.add_argument("--target-diagnostics", nargs="+", default=None)
     dispatch_p.add_argument("--evidence-limit", type=int, default=16)
+    dispatch_p.add_argument("--dispatch-candidates", type=int, default=None)
+    dispatch_p.add_argument("--archive-candidates", type=int, default=0)
+    dispatch_p.add_argument(
+        "--evidence-scope",
+        choices=["current-run", "matching-runs", "explicit"],
+        default="current-run",
+    )
+    dispatch_p.add_argument("--motif-sources", nargs="*", default=None)
+    dispatch_p.add_argument("--motif-diff-chars", type=int, default=12000)
+    dispatch_p.add_argument("--paper-baseline-method", default="Ms-AeDNet")
+    dispatch_p.add_argument("--paper-baseline-mae", type=float, default=None)
+    dispatch_p.add_argument("--paper-baseline-mse", type=float, default=None)
     dispatch_p.add_argument("--min-relative-improvement", type=float, default=0.0)
     dispatch_p.add_argument("--epochs", type=int, default=None)
     dispatch_p.add_argument("--batch-size", type=int, default=None)
@@ -1594,6 +2695,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument("--hidden-dim", type=int, default=None)
     sweep_p.add_argument("--layer", type=int, default=None)
     sweep_p.add_argument("--dropout", type=float, default=None)
+    _add_final_dispatch_args(sweep_p)
     sweep_p.set_defaults(func=cmd_sweep)
 
     summarize_p = sub.add_parser("summarize-sweep", help="refresh sweep summary from child run summaries")

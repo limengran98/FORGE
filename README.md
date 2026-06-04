@@ -77,25 +77,50 @@ strict sequential chain.
 
 ## Evidence Dispatch
 
-After Diagnostic Probers finish, run Evidence Dispatch once to ask the LLM for a
-single evidence-grounded final candidate. The best prober model is copied as a
-protected parent first, and the dispatcher candidate is accepted only if the same
-fixed PEMFC harness shows non-regression on the target metric and MSE plus an
-executable improvement in the target metric, MSE, or selected diagnostic probes.
-Otherwise the final model is the protected prober best.
+After Diagnostic Probers finish, Evidence Dispatch is summary-only by default.
+FORGE mines successful PEMFC patch motifs only from the preceding iterations of
+the same run, asks the LLM to summarize the executable evidence, and copies the
+protected prober best to `final/model.py`. It does not generate or evaluate a new
+model candidate in the main workflow.
 
 ```bash
 python -m forge.cli dispatch \
   --run-dir runs/<sweep_name>/FC1_L24_P12 \
   --llm-mode required \
+  --dispatch-mode summary \
+  --evidence-scope current-run \
+  --archive-candidates 0 \
   --target-diagnostics long_horizon_error residual_autocorrelation residual_drift \
   --device cuda \
   --cuda-id 0
 ```
 
 The dispatch artifact is saved under
-`runs/<run_name>/evidence_dispatch*/` with `protected_best/`, `candidate/`,
-`final/`, `dispatch_payload.json`, and `dispatch_summary.json`.
+`runs/<run_name>/evidence_dispatch*/` with `protected_best/`, `final/`,
+`dispatch_payload.json`, `dispatch_report.json`, and `dispatch_summary.json`.
+The old counterfactual motif tournament is kept as an explicit ablation via
+`--dispatch-mode candidates --dispatch-candidates 4`; it is not the recommended
+main path because the protected harness usually rejects these late candidates.
+For settings not listed in `configs/harness/pemfc_harness.yaml`, pass
+`--paper-baseline-mae` and `--paper-baseline-mse`.
+
+Run iterations and current-run-only evidence summary as one integrated workflow:
+
+```bash
+python -m forge.cli sweep \
+  --datasets FC1 FC2 \
+  --seq-lens 24 \
+  --pred-lens 12 \
+  --rounds 20 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --final-dispatch \
+  --dispatch-mode summary \
+  --dispatch-llm-mode required \
+  --archive-candidates 0
+```
 
 ## Trust Routing And Ablations
 
@@ -167,7 +192,8 @@ Most FORGE protocol constants live outside Python:
 - `configs/harness/heuristic_patches.yaml`: component-to-template fallback mapping
 - `skills/forge_model_templates/`: complete fallback model templates
 - `prompts/model_patch.yaml`: LLM patch prompt
-- `prompts/evidence_dispatch.yaml`: protected final-candidate dispatch prompt
+- `prompts/evidence_summary.yaml`: summary-only evidence dispatch prompt
+- `prompts/evidence_dispatch.yaml`: optional final-candidate ablation prompt
 
 ## Outputs
 
@@ -182,7 +208,7 @@ Runs are written under `runs/<run_name>/`:
 - `task_graph.json`: evolving component graph state and feedback-component trust relations
 - `graph_events.jsonl`: append-only orchestration event log
 - `summary.json`: run-level summary
-- `evidence_dispatch*/dispatch_summary.json`: protected best, dispatcher candidate, harness decision, and final model path
+- `evidence_dispatch*/dispatch_summary.json`: protected best, mined motifs, summary report, and final model path
 
 ## Graph Orchestration
 
