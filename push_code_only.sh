@@ -34,6 +34,7 @@ fi
 CODE_PATHS=(
   ".gitignore"
   "README.md"
+  "docs/figures"
   "requirements.txt"
   "push_code_only.sh"
   "forge"
