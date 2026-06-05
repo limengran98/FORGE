@@ -11,12 +11,15 @@ SKILLS_DIR = PROJECT_ROOT / "skills"
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 RUNS_DIR = PROJECT_ROOT / "runs"
 DATA_DIR = PROJECT_ROOT / "data"
+REFERENCE_DIR = PROJECT_ROOT / "reference"
 
-MS_AEDNET_ZIP = PROJECT_ROOT / "Ms-AeDNet-main.zip"
-CELLSCIENTIST_ZIP = PROJECT_ROOT / "CellScientist-main.zip"
+MS_AEDNET_ZIP = REFERENCE_DIR / "Ms-AeDNet-main.zip"
+CELLSCIENTIST_ZIP = REFERENCE_DIR / "CellScientist-main.zip"
+LEGACY_MS_AEDNET_ZIP = PROJECT_ROOT / "Ms-AeDNet-main.zip"
+LEGACY_CELLSCIENTIST_ZIP = PROJECT_ROOT / "CellScientist-main.zip"
 INITIAL_MODEL_PATH = WORKSPACE_DIR / "initial_model.py"
 
 
 def ensure_project_dirs() -> None:
-    for path in (CONFIG_DIR, HARNESS_CONFIG_DIR, PROMPTS_DIR, SKILLS_DIR, WORKSPACE_DIR, RUNS_DIR, DATA_DIR):
+    for path in (CONFIG_DIR, HARNESS_CONFIG_DIR, PROMPTS_DIR, SKILLS_DIR, WORKSPACE_DIR, RUNS_DIR, DATA_DIR, REFERENCE_DIR):
         path.mkdir(parents=True, exist_ok=True)

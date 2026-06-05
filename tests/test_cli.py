@@ -303,7 +303,7 @@ def test_paper_gap_zero_when_forge_beats_target_but_signed_delta_is_negative():
 
 def test_paper_delta_line_always_reports_signed_improvement_pct():
     line = _format_paper_delta_line(
-        "FORGE vs paper target",
+        "FORGE vs reference target",
         {
             "mae": 0.50,
             "mse": -0.20,
@@ -313,7 +313,7 @@ def test_paper_delta_line_always_reports_signed_improvement_pct():
         },
     )
 
-    assert "improvement over paper target" in line
+    assert "improvement over reference target" in line
     assert "MAE=-10.00%" in line
     assert "MSE=2.00%" in line
 
@@ -337,7 +337,7 @@ def test_print_forge_best_summary_omits_clipped_remaining_gap(capsys):
     output = capsys.readouterr().out
     assert "FORGE best: iter_016 MAE=4.2593 MSE=8.9407" in output
     assert "Remaining gap" not in output
-    assert "improvement over paper target" in output
+    assert "improvement over reference target" in output
 
 
 def test_write_run_summary_selects_single_best_from_full_history(tmp_path):

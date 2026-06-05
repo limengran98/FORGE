@@ -573,7 +573,7 @@ def _print_forge_best_summary(summary: dict[str, Any], label: str = "FORGE best"
     )
     paper_delta = summary.get("paper_delta") or {}
     if paper_delta:
-        print(_format_paper_delta_line("FORGE vs paper target", paper_delta))
+        print(_format_paper_delta_line("FORGE vs reference target", paper_delta))
 
 
 def _safe_metric(value: Any, default: float = float("inf")) -> float:
@@ -680,8 +680,8 @@ def _paper_target_delta(result: dict[str, Any], paper_baseline: dict[str, float]
         "beats_mse": mse_delta < 0,
         "beats_both": mae_delta < 0 and mse_delta < 0,
         "note": (
-            "Signed delta is FORGE paper-scaled metric minus paper target; negative means FORGE is better. "
-            "Improvement percent is (paper_target - FORGE) / paper_target * 100; positive means FORGE is better."
+            "Signed delta is FORGE benchmark-scaled metric minus reference target; negative means FORGE is better. "
+            "Improvement percent is (reference_target - FORGE) / reference_target * 100; positive means FORGE is better."
         ),
     }
 
@@ -693,12 +693,12 @@ def _format_paper_delta_line(label: str, delta: dict[str, Any]) -> str:
     mse_pct = _safe_metric(delta.get("mse_improvement_pct"), 0.0)
     if bool(delta.get("beats_both")):
         return (
-            f"[FORGE] {label}: improvement over paper target "
+            f"[FORGE] {label}: improvement over reference target "
             f"MAE={mae_pct:.2f}% MSE={mse_pct:.2f}% "
             f"(absolute better by MAE={_format_metric(abs(mae_delta))} MSE={_format_metric(abs(mse_delta))})"
         )
     return (
-        f"[FORGE] {label}: improvement over paper target "
+        f"[FORGE] {label}: improvement over reference target "
         f"MAE={mae_pct:.2f}% MSE={mse_pct:.2f}% "
         f"(signed_delta MAE={_format_metric(mae_delta)} MSE={_format_metric(mse_delta)}; "
         "positive improvement means FORGE is better)"
@@ -2407,12 +2407,12 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[FORGE] Evidence Dispatch archive models mined: {archive_library['total_mined']}")
     if paper_baseline:
         print(
-            "[FORGE] Ms-AeDNet paper target: "
+            "[FORGE] Reference target: "
             f"{paper_baseline['dataset']} L{paper_baseline['seq_len']} P{paper_baseline['pred_len']} "
             f"MAE={paper_baseline['mae']} MSE={paper_baseline['mse']}"
         )
     else:
-        print("[FORGE] No Ms-AeDNet paper target found; falling back to protected non-regression acceptance.")
+        print("[FORGE] No reference target found; falling back to protected non-regression acceptance.")
     if not bool(getattr(args, "suppress_metric_summary", False)):
         protected_summary = {
             "best_iteration": protected_iteration,

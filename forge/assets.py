@@ -4,13 +4,19 @@ import zipfile
 from pathlib import Path
 
 from .harness_spec import get_archive_input_prefix, get_dataset_files, get_default_dataset_name
-from .paths import DATA_DIR, MS_AEDNET_ZIP
+from .paths import DATA_DIR, LEGACY_MS_AEDNET_ZIP, MS_AEDNET_ZIP
+
+
+def _resolve_data_archive() -> Path:
+    for path in (MS_AEDNET_ZIP, LEGACY_MS_AEDNET_ZIP):
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Missing PEMFC data archive: {MS_AEDNET_ZIP}")
 
 
 def ensure_ms_aednet_data(data_root: str | Path | None = None) -> dict[str, Path]:
     """Extract the Ms-AeDNet PEMFC CSV files if they are not already present."""
-    if not MS_AEDNET_ZIP.exists():
-        raise FileNotFoundError(f"Missing baseline archive: {MS_AEDNET_ZIP}")
+    archive_path = _resolve_data_archive()
 
     root = Path(data_root) if data_root is not None else DATA_DIR / "ms_aednet"
     input_dir = root / "input"
@@ -19,14 +25,14 @@ def ensure_ms_aednet_data(data_root: str | Path | None = None) -> dict[str, Path
     paths: dict[str, Path] = {}
     dataset_files = get_dataset_files()
     archive_prefix = get_archive_input_prefix().rstrip("/")
-    with zipfile.ZipFile(MS_AEDNET_ZIP) as zf:
+    with zipfile.ZipFile(archive_path) as zf:
         archive_names = set(zf.namelist())
         for data_name, filename in dataset_files.items():
             target = input_dir / filename
             if not target.exists():
                 member = f"{archive_prefix}/{filename}"
                 if member not in archive_names:
-                    raise FileNotFoundError(f"Missing {member} inside {MS_AEDNET_ZIP}")
+                    raise FileNotFoundError(f"Missing {member} inside {archive_path}")
                 with zf.open(member) as src, target.open("wb") as dst:
                     dst.write(src.read())
             paths[data_name] = target
