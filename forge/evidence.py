@@ -154,6 +154,137 @@ def _aligned_with_evidence(patch: dict[str, Any], routed_component: str | None) 
     return routed_component in components and not bool(patch.get("component_mismatch"))
 
 
+def _safe_mean(values: list[float]) -> float:
+    finite = [value for value in values if math.isfinite(value)]
+    return sum(finite) / len(finite) if finite else 0.0
+
+
+def _metric_value(result: dict[str, Any], section: str, name: str) -> float:
+    if not isinstance(result, dict) or not result.get("success"):
+        return math.inf
+    return _safe_float(result.get("metrics", {}).get(section, {}).get(name))
+
+
+def _paper_mae(result: dict[str, Any]) -> float:
+    return _metric_value(result, "paper_scaled", "mae")
+
+
+def _paper_mse(result: dict[str, Any]) -> float:
+    return _metric_value(result, "paper_scaled", "mse")
+
+
+def _selected_edit_field(patch: dict[str, Any], key: str) -> str | None:
+    selected = patch.get("selected_edit") or {}
+    if not isinstance(selected, dict):
+        return None
+    value = selected.get(key)
+    return str(value) if value is not None else None
+
+
+def _route_relation_ids(patch: dict[str, Any]) -> list[str]:
+    relation_ids: list[str] = []
+    for row in patch.get("route_propagations") or []:
+        if isinstance(row, dict) and row.get("relation_id"):
+            relation_ids.append(str(row["relation_id"]))
+    return relation_ids
+
+
+def _trust_before_mean(patch: dict[str, Any]) -> float:
+    trust_before = patch.get("trust_before") or {}
+    if not isinstance(trust_before, dict):
+        return 0.0
+    relation_ids = _route_relation_ids(patch)
+    if relation_ids:
+        return _safe_mean([_safe_float(trust_before.get(relation_id), math.nan) for relation_id in relation_ids])
+    return _safe_mean([_safe_float(value, math.nan) for value in trust_before.values()])
+
+
+def _matching_trust_updates(graph_state: dict[str, Any], outcome_iteration: int, patch: dict[str, Any]) -> list[dict[str, Any]]:
+    updates = (
+        graph_state.get("iterations", {})
+        .get(_iter_key(outcome_iteration), {})
+        .get("trust_updates", [])
+    )
+    if not isinstance(updates, list):
+        return []
+    relation_ids = set(_route_relation_ids(patch))
+    components = {
+        str(row.get("component"))
+        for row in patch.get("route_propagations") or []
+        if isinstance(row, dict) and row.get("component")
+    }
+    diagnostics = {
+        str(row.get("diagnostic"))
+        for row in patch.get("route_propagations") or []
+        if isinstance(row, dict) and row.get("diagnostic")
+    }
+    matched = []
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        update_relation = str(update.get("relation_id") or "")
+        if update_relation and update_relation in relation_ids:
+            matched.append(update)
+            continue
+        update_component = str(update.get("component") or "")
+        update_diagnostic = str(update.get("diagnostic") or "")
+        if update_component in components and update_diagnostic in diagnostics:
+            matched.append(update)
+    return matched
+
+
+def _trust_after_mean(updates: list[dict[str, Any]]) -> float:
+    return _safe_mean([_safe_float(row.get("trust_after"), math.nan) for row in updates])
+
+
+def _trust_reward_mean(updates: list[dict[str, Any]]) -> float:
+    values = []
+    for row in updates:
+        reward = row.get("reward") or {}
+        if isinstance(reward, dict):
+            values.append(_safe_float(reward.get("reward"), math.nan))
+    return _safe_mean(values)
+
+
+def _trace_paths(graph_state: dict[str, Any], outcome_iteration: int, patch_iteration: int) -> dict[str, Any]:
+    patch_record = graph_state.get("iterations", {}).get(_iter_key(patch_iteration), {})
+    outcome_record = graph_state.get("iterations", {}).get(_iter_key(outcome_iteration), {})
+    artifacts = outcome_record.get("artifacts", {}) if isinstance(outcome_record, dict) else {}
+    patch_artifacts = patch_record.get("artifacts", {}) if isinstance(patch_record, dict) else {}
+
+    def artifact_path(rows: dict[str, Any], name: str) -> str | None:
+        row = rows.get(name) if isinstance(rows, dict) else None
+        if isinstance(row, dict):
+            return row.get("path")
+        return None
+
+    patch = patch_record.get("patch", {}) if isinstance(patch_record, dict) else {}
+    return {
+        "model_path": outcome_record.get("model_path") if isinstance(outcome_record, dict) else None,
+        "result_path": artifact_path(artifacts, "result"),
+        "metrics_path": artifact_path(artifacts, "metrics"),
+        "feedback_path": artifact_path(artifacts, "feedback_vector"),
+        "routing_path": artifact_path(artifacts, "routing"),
+        "report_path": artifact_path(artifacts, "report"),
+        "diff_path": patch.get("diff_path") or artifact_path(patch_artifacts, "diff_path"),
+        "output_model_path": patch.get("output_model_path") or artifact_path(patch_artifacts, "output_model_path"),
+    }
+
+
+def _compact_strategy_snapshot(outcome_row: dict[str, Any], patch: dict[str, Any], stagnated: bool) -> dict[str, Any]:
+    return {
+        "primary_component": outcome_row.get("primary_component"),
+        "active_components": outcome_row.get("active_components") or [],
+        "selected_component": _selected_edit_field(patch, "component"),
+        "selected_edit_operator": _selected_edit_field(patch, "edit_operator"),
+        "negative_memory_count": len(patch.get("negative_memory") or []),
+        "negative_suppression_count": len(patch.get("negative_reuse_suppression") or []),
+        "controlled_exploration": patch.get("controlled_exploration") or {},
+        "relation_attention": patch.get("relation_attention") or {},
+        "stagnated_window": stagnated,
+    }
+
+
 def _rate(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
 
@@ -189,6 +320,7 @@ def build_run_evidence_audit(
     aligned_count = 0
     alignable_count = 0
     repair_attempt_count = 0
+    best_so_far = initial_target
 
     for outcome_iteration in sorted(rows_by_iter):
         if outcome_iteration <= 0:
@@ -208,6 +340,7 @@ def build_run_evidence_audit(
         outcome_target = _target_value(outcome_result, target_metric)
         success = bool(outcome_result.get("success"))
         improved = bool(success and math.isfinite(parent_target) and outcome_target < parent_target - 1e-12)
+        improved_vs_best_so_far = bool(success and math.isfinite(best_so_far) and outcome_target < best_so_far - 1e-12)
         repair_attempts = patch.get("repair_attempts") or []
         repair_attempt_count += len(repair_attempts)
 
@@ -238,27 +371,81 @@ def build_run_evidence_audit(
         if aligned is not None:
             alignable_count += 1
             aligned_count += 1 if aligned else 0
+        trust_updates = _matching_trust_updates(graph_state, outcome_iteration, patch)
+        relation_ids = _route_relation_ids(patch)
+        trace_paths = _trace_paths(graph_state, outcome_iteration, patch_iteration)
+        parent_iteration = patch.get("parent_iteration")
+        try:
+            parent_iteration_int = int(parent_iteration) if parent_iteration is not None else patch_iteration
+        except Exception:
+            parent_iteration_int = patch_iteration
+        branch_mode = "best_so_far_parent" if parent_iteration_int != patch_iteration else "last_parent"
+        parent_result = rows_by_iter.get(parent_iteration_int, {}).get("result") or {}
+        parent_paper_mae = _paper_mae(parent_result)
+        parent_paper_mse = _paper_mse(parent_result)
+        outcome_paper_mae = _paper_mae(outcome_result)
+        outcome_paper_mse = _paper_mse(outcome_result)
+        target_delta = (
+            parent_target - outcome_target
+            if math.isfinite(parent_target) and math.isfinite(outcome_target)
+            else 0.0
+        )
+        paper_mae_delta = (
+            parent_paper_mae - outcome_paper_mae
+            if math.isfinite(parent_paper_mae) and math.isfinite(outcome_paper_mae)
+            else 0.0
+        )
+        paper_mse_delta = (
+            parent_paper_mse - outcome_paper_mse
+            if math.isfinite(parent_paper_mse) and math.isfinite(outcome_paper_mse)
+            else 0.0
+        )
+        active_memory_state = _compact_strategy_snapshot(outcome_row, patch, False)
 
         attempts.append(
             {
                 "patch_iteration": patch_iteration,
                 "outcome_iteration": outcome_iteration,
+                "parent_iteration": parent_iteration_int,
+                "branch_mode": branch_mode,
                 "success": success,
                 "component": component,
                 "routed_component": routed_component or None,
+                "selected_component": _selected_edit_field(patch, "component"),
+                "selected_edit_operator": _selected_edit_field(patch, "edit_operator"),
                 "edit_action": edit_action,
                 "dominant_diagnostic": dominant_diagnostic,
+                "relation_ids": relation_ids,
+                "route_relation_count": len(relation_ids),
+                "trust_before_mean": _trust_before_mean(patch),
+                "trust_after_mean": _trust_after_mean(trust_updates),
+                "trust_reward_mean": _trust_reward_mean(trust_updates),
                 "parent_target": parent_target,
                 "outcome_target": outcome_target,
-                "target_delta": parent_target - outcome_target
-                if math.isfinite(parent_target) and math.isfinite(outcome_target)
-                else 0.0,
+                "target_delta": target_delta,
+                "parent_paper_mae": parent_paper_mae,
+                "outcome_paper_mae": outcome_paper_mae,
+                "paper_mae_delta": paper_mae_delta,
+                "parent_paper_mse": parent_paper_mse,
+                "outcome_paper_mse": outcome_paper_mse,
+                "paper_mse_delta": paper_mse_delta,
                 "improved": improved,
+                "improved_vs_best_so_far": improved_vs_best_so_far,
                 "invalid_edit": invalid,
                 "repeated_useless_edit": repeated_useless,
+                "negative_memory_count": len(patch.get("negative_memory") or []),
+                "negative_suppression_count": len(patch.get("negative_reuse_suppression") or []),
+                "repair_attempt_count": len(repair_attempts),
+                "edit_operator_mismatch": bool(patch.get("edit_operator_mismatch")),
+                "component_mismatch": bool(patch.get("component_mismatch")),
+                "validation_fallback": bool(patch.get("validation_fallback")),
                 "evidence_aligned": aligned,
+                "active_memory_state": active_memory_state,
+                "trace_paths": trace_paths,
             }
         )
+        if success and math.isfinite(outcome_target):
+            best_so_far = min(best_so_far, outcome_target)
 
     total_attempts = len(attempts)
     improved_attempts = [row for row in attempts if row["improved"]]
@@ -348,11 +535,152 @@ def build_run_evidence_audit(
         },
     }
 
+    relation_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    component_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in attempts:
+        relation_ids = row.get("relation_ids") or []
+        if relation_ids:
+            for relation_id in relation_ids:
+                parts = str(relation_id).split("->", 1)
+                diagnostic = parts[0] if parts else str(row.get("dominant_diagnostic") or "unknown")
+                component = parts[1] if len(parts) > 1 else str(row.get("routed_component") or row.get("component") or "unknown")
+                key = (diagnostic, component, str(row.get("edit_action") or "unknown"), str(relation_id))
+                relation_groups[key].append(row)
+        else:
+            relation_id = (
+                f"{row.get('dominant_diagnostic') or 'unknown'}"
+                f"->{row.get('routed_component') or row.get('component') or 'unknown'}"
+            )
+            key = (
+                str(row.get("dominant_diagnostic") or "unknown"),
+                str(row.get("routed_component") or row.get("component") or "unknown"),
+                str(row.get("edit_action") or "unknown"),
+                relation_id,
+            )
+            relation_groups[key].append(row)
+        component_groups[str(row.get("component") or "unknown")].append(row)
+
+    relation_table = []
+    for (diagnostic, component, edit_action, relation_id), rows in sorted(relation_groups.items()):
+        relation_table.append(
+            {
+                "relation_id": relation_id,
+                "diagnostic": diagnostic,
+                "component": component,
+                "edit_action": edit_action,
+                "attempt_count": len(rows),
+                "success_count": sum(1 for row in rows if row.get("success")),
+                "improved_count": sum(1 for row in rows if row.get("improved")),
+                "best_improvement_count": sum(1 for row in rows if row.get("improved_vs_best_so_far")),
+                "invalid_count": sum(1 for row in rows if row.get("invalid_edit")),
+                "repeated_useless_count": sum(1 for row in rows if row.get("repeated_useless_edit")),
+                "mean_target_delta": _safe_mean([_safe_float(row.get("target_delta"), math.nan) for row in rows]),
+                "mean_paper_mae_delta": _safe_mean([_safe_float(row.get("paper_mae_delta"), math.nan) for row in rows]),
+                "mean_paper_mse_delta": _safe_mean([_safe_float(row.get("paper_mse_delta"), math.nan) for row in rows]),
+                "mean_trust_before": _safe_mean([_safe_float(row.get("trust_before_mean"), math.nan) for row in rows]),
+                "mean_trust_after": _safe_mean([_safe_float(row.get("trust_after_mean"), math.nan) for row in rows]),
+                "mean_trust_reward": _safe_mean([_safe_float(row.get("trust_reward_mean"), math.nan) for row in rows]),
+                "last_outcome_iteration": max(int(row.get("outcome_iteration", 0)) for row in rows),
+            }
+        )
+
+    component_table = []
+    for component, rows in sorted(component_groups.items()):
+        component_table.append(
+            {
+                "component": component,
+                "attempt_count": len(rows),
+                "success_count": sum(1 for row in rows if row.get("success")),
+                "improved_count": sum(1 for row in rows if row.get("improved")),
+                "best_improvement_count": sum(1 for row in rows if row.get("improved_vs_best_so_far")),
+                "invalid_count": sum(1 for row in rows if row.get("invalid_edit")),
+                "repeated_useless_count": sum(1 for row in rows if row.get("repeated_useless_edit")),
+                "mean_target_delta": _safe_mean([_safe_float(row.get("target_delta"), math.nan) for row in rows]),
+                "mean_paper_mae_delta": _safe_mean([_safe_float(row.get("paper_mae_delta"), math.nan) for row in rows]),
+                "mean_paper_mse_delta": _safe_mean([_safe_float(row.get("paper_mse_delta"), math.nan) for row in rows]),
+                "dominant_diagnostics": sorted(
+                    {
+                        str(row.get("dominant_diagnostic"))
+                        for row in rows
+                        if row.get("dominant_diagnostic")
+                    }
+                ),
+                "last_outcome_iteration": max(int(row.get("outcome_iteration", 0)) for row in rows),
+            }
+        )
+
+    strategy_timeline = [
+        {
+            "outcome_iteration": row["outcome_iteration"],
+            "parent_iteration": row["parent_iteration"],
+            "branch_mode": row["branch_mode"],
+            "dominant_diagnostic": row.get("dominant_diagnostic"),
+            "routed_component": row.get("routed_component"),
+            "selected_component": row.get("selected_component"),
+            "edit_action": row.get("edit_action"),
+            "improved": row.get("improved"),
+            "improved_vs_best_so_far": row.get("improved_vs_best_so_far"),
+            "invalid_edit": row.get("invalid_edit"),
+            "negative_memory_count": row.get("negative_memory_count"),
+            "negative_suppression_count": row.get("negative_suppression_count"),
+            "trust_before_mean": row.get("trust_before_mean"),
+            "trust_after_mean": row.get("trust_after_mean"),
+            "target_delta": row.get("target_delta"),
+        }
+        for row in attempts
+    ]
+
+    method_evidence_table = [
+        {
+            "claim": "active_memory_reconstruction",
+            "saved_evidence": "strategy_timeline, relation_table, trust_before/after, diagnostic route history",
+            "primary_metrics": "routing_stability, evidence_alignment, mean_trust_reward",
+            "artifact": "evidence/evidence_strategy_timeline.csv; evidence/evidence_relations.csv",
+        },
+        {
+            "claim": "test_time_adaptation",
+            "saved_evidence": "per-iteration strategy state and refresh triggers",
+            "primary_metrics": "improvement_rate, best_improvement_count, stagnation trigger",
+            "artifact": "summary.json/evidence_audit.strategy_memory; evidence/evidence_strategy_timeline.csv",
+        },
+        {
+            "claim": "experience_reuse",
+            "saved_evidence": "negative memory, suppression count, repeated useless edit count, trusted components",
+            "primary_metrics": "repeated_useless_edit_rate, invalid_edit_rate, trusted component success counts",
+            "artifact": "evidence/evidence_attempts.csv; evidence/evidence_components.csv",
+        },
+        {
+            "claim": "graph_branch_level_search",
+            "saved_evidence": "parent_iteration, branch_mode, protected best parent selection",
+            "primary_metrics": "best_so_far_parent count, attempts_to_best, budget_efficiency",
+            "artifact": "evidence/evidence_attempts.csv",
+        },
+        {
+            "claim": "domain_native_harness",
+            "saved_evidence": "same harness metrics, result paths, feedback vectors, validation fallback flags",
+            "primary_metrics": "invalid_edit_rate, success_count, benchmark-scaled MAE/MSE deltas",
+            "artifact": "iter_*/metrics.json; evidence/evidence_attempts.csv",
+        },
+        {
+            "claim": "auditable_trajectories",
+            "saved_evidence": "model path, diff path, feedback path, routing path, report path",
+            "primary_metrics": "complete trace availability per attempt",
+            "artifact": "evidence/evidence_attempts.csv; task_graph.json; graph_events.jsonl",
+        },
+    ]
+
     return {
         "schema": "forge.evidence_audit.v1",
         "method_framework": method_framework(candidate_tournament_k),
         "metrics": metrics,
         "routing_stability_by_diagnostic": stability_rows,
         "strategy_memory": strategy_memory,
+        "tables": {
+            "attempts": attempts,
+            "relations": relation_table,
+            "components": component_table,
+            "strategy_timeline": strategy_timeline,
+            "method_evidence": method_evidence_table,
+        },
         "attempts_tail": attempts[-12:],
     }

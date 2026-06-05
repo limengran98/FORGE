@@ -77,3 +77,15 @@ def test_evidence_audit_computes_routing_metrics():
     assert metrics["routing_stability"] == 1.0
     assert metrics["evidence_alignment"] == 1.0
     assert metrics["budget_efficiency"]["attempts_to_best"] == 1
+    assert audit["tables"]["attempts"][0]["branch_mode"] == "last_parent"
+    assert audit["tables"]["attempts"][0]["trust_before_mean"] == 0.0
+    assert audit["tables"]["relations"][0]["attempt_count"] == 2
+    assert audit["tables"]["components"][0]["component"] == "temporal_memory"
+    assert {
+        "active_memory_reconstruction",
+        "test_time_adaptation",
+        "experience_reuse",
+        "graph_branch_level_search",
+        "domain_native_harness",
+        "auditable_trajectories",
+    } == {row["claim"] for row in audit["tables"]["method_evidence"]}

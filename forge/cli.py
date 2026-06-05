@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import difflib
+import json
 import math
 import re
 import shutil
@@ -485,6 +486,58 @@ def _load_iteration_json(orchestrator: GraphOrchestrator, iteration: int, artifa
     return load_json(_resolve_stored_path(path, orchestrator.run_root))
 
 
+def _csv_value(value: Any) -> Any:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    return value
+
+
+def _write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _csv_value(row.get(key)) for key in fieldnames})
+
+
+def _write_evidence_artifacts(run_root: Path, audit: dict[str, Any]) -> dict[str, Any]:
+    evidence_dir = run_root / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = evidence_dir / "evidence_audit.json"
+    save_json(audit, audit_path)
+
+    tables = audit.get("tables") or {}
+    table_files = {
+        "attempts": evidence_dir / "evidence_attempts.csv",
+        "relations": evidence_dir / "evidence_relations.csv",
+        "components": evidence_dir / "evidence_components.csv",
+        "strategy_timeline": evidence_dir / "evidence_strategy_timeline.csv",
+        "method_evidence": evidence_dir / "evidence_method_table.csv",
+    }
+    table_counts: dict[str, int] = {}
+    for name, path in table_files.items():
+        rows = tables.get(name) or []
+        if not isinstance(rows, list):
+            rows = []
+        _write_csv_rows(path, rows)
+        table_counts[name] = len(rows)
+
+    return {
+        "dir": str(evidence_dir),
+        "audit_json": str(audit_path),
+        "tables": {name: str(path) for name, path in table_files.items()},
+        "table_counts": table_counts,
+    }
+
+
 def _write_run_summary(
     run_root: Path,
     rounds: int,
@@ -542,12 +595,14 @@ def _write_run_summary(
             "successful_candidate_count": len(successful_iterations),
             "note": "Best model is selected once from the full iteration history, including resumed continuation rounds.",
         }
-    summary["evidence_audit"] = build_run_evidence_audit(
+    evidence_audit = build_run_evidence_audit(
         graph_state or {},
         history,
         target_metric,
         candidate_tournament_k=candidate_tournament_k,
     )
+    summary["evidence_audit"] = evidence_audit
+    summary["evidence_artifacts"] = _write_evidence_artifacts(run_root, evidence_audit)
     save_json(summary, run_root / "summary.json")
     return summary
 
@@ -574,6 +629,21 @@ def _print_forge_best_summary(summary: dict[str, Any], label: str = "FORGE best"
     paper_delta = summary.get("paper_delta") or {}
     if paper_delta:
         print(_format_paper_delta_line("FORGE vs reference target", paper_delta))
+
+
+def _print_evidence_artifact_summary(summary: dict[str, Any]) -> None:
+    artifacts = summary.get("evidence_artifacts") or {}
+    evidence_dir = artifacts.get("dir")
+    counts = artifacts.get("table_counts") or {}
+    if not evidence_dir:
+        return
+    print(
+        "[FORGE] Evidence tables: "
+        f"{evidence_dir} "
+        f"(attempts={counts.get('attempts', 0)}, "
+        f"relations={counts.get('relations', 0)}, "
+        f"components={counts.get('components', 0)})"
+    )
 
 
 def _safe_metric(value: Any, default: float = float("inf")) -> float:
@@ -1830,6 +1900,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         summary["final_dispatch"] = _compact_dispatch_summary(dispatch_summary)
         save_json(summary, run_root / "summary.json")
     _print_forge_best_summary(summary)
+    _print_evidence_artifact_summary(summary)
     print(f"[FORGE] Finished. Summary: {run_root / 'summary.json'}")
     return summary
 
@@ -2074,6 +2145,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
     orchestrator.event("continue_finished", {"to_round": to_round})
     orchestrator.save()
     _print_forge_best_summary(summary)
+    _print_evidence_artifact_summary(summary)
     print(f"[FORGE] Continue finished. Summary: {run_root / 'summary.json'}")
     if refreshed_sweep is not None:
         print(f"[FORGE] Parent sweep summary refreshed: {refreshed_sweep / 'sweep_summary.json'}")
@@ -2821,6 +2893,7 @@ def cmd_summarize_run(args: argparse.Namespace) -> dict[str, Any]:
         summary["final_dispatch"] = previous_summary["final_dispatch"]
         save_json(summary, run_root / "summary.json")
     _print_forge_best_summary(summary)
+    _print_evidence_artifact_summary(summary)
     print(f"[FORGE] Run summary refreshed: {run_root / 'summary.json'}")
     return summary
 

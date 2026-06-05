@@ -393,6 +393,12 @@ Runs are written under `runs/<run_name>/`:
 - `graph_events.jsonl`: append-only orchestration event log
 - `summary.json`: run-level summary
 - `summary.json/evidence_audit`: trustworthy feedback-routing metrics and adaptive strategy memory
+- `evidence/evidence_audit.json`: full evidence audit with metrics, tables, and strategy memory
+- `evidence/evidence_attempts.csv`: per-iteration evidence table for routing, patch, parent branch, outcome, and trace paths
+- `evidence/evidence_relations.csv`: feedback-component-edit relation table with trust and outcome statistics
+- `evidence/evidence_components.csv`: component-level success, failure, reuse, and metric-delta table
+- `evidence/evidence_strategy_timeline.csv`: test-time adaptation timeline across iterations
+- `evidence/evidence_method_table.csv`: method-claim-to-artifact map for active memory, reuse, branch search, harness grounding, and auditability
 - `evidence_dispatch*/dispatch_summary.json`: protected best, mined motifs, summary report, and final model path
 
 ## Graph Orchestration
