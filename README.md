@@ -49,31 +49,207 @@ python -m forge.cli run --rounds 2 --epochs 200 --llm-mode required --routing-mo
 
 The LLM config is at `configs/forge_llm.yaml`.
 
-## Continue Iterations
+## Recommended Experiment Workflow
 
-`run --rounds 1` creates and evaluates `iter_000` and `iter_001`. To keep
-improving that same run, continue from the last completed iteration instead of
-starting over:
+Use this section for normal FORGE experiments. The recommended protocol is:
+
+1. Run each dataset independently for 20 rounds.
+2. Inspect `best_iteration`, paper-scaled MAE/MSE, improvement percent, and
+   `evidence_audit`.
+3. If the best model appears near the last round, continue the same run by 10
+   rounds.
+4. Use `--parent-policy best` so bad exploratory patches update evidence memory
+   but do not become the next parent model.
+
+Start a fresh FC1 20-round run:
 
 ```bash
-python -m forge.cli continue --run-dir runs/<run_name> --additional-rounds 1 --epochs 200 --llm-mode required --routing-mode trust --parent-policy best
+python -m forge.cli run \
+  --data FC1 \
+  --seq-len 24 \
+  --pred-len 12 \
+  --rounds 20 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --candidate-tournament-k 1 \
+  --final-dispatch \
+  --dispatch-mode summary \
+  --dispatch-llm-mode required \
+  --archive-candidates 0 \
+  --device cuda \
+  --cuda-id 0 \
+  --run-name pilot_trust_summary_FC1_L24_P12_R20
 ```
 
-You can also target an absolute iteration index:
+Start a fresh FC2 20-round run:
 
 ```bash
-python -m forge.cli continue --run-dir runs/<run_name> --to-round 3 --epochs 200 --llm-mode required --routing-mode trust --parent-policy best
+python -m forge.cli run \
+  --data FC2 \
+  --seq-len 24 \
+  --pred-len 12 \
+  --rounds 20 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --candidate-tournament-k 1 \
+  --final-dispatch \
+  --dispatch-mode summary \
+  --dispatch-llm-mode required \
+  --archive-candidates 0 \
+  --device cuda \
+  --cuda-id 0 \
+  --run-name pilot_trust_summary_FC2_L24_P12_R20
 ```
 
-`--additional-rounds 1` means "add one more patch/evaluation after the current
-last iteration." `--to-round 3` means "finish at `iter_003`." The command reuses
-the existing `run_config.json`, model code, feedback vectors, routing records,
-task graph, and patch artifacts. It only generates the missing next patch and
-then evaluates the next model.
+Continue an existing FC1 run by 10 more rounds:
 
-`--parent-policy best` uses degraded iterations to update trust, but starts the
-next edit from the current best model source. `--parent-policy last` gives a
-strict sequential chain.
+```bash
+python -m forge.cli continue \
+  --run-dir runs/pilot_trust_summary_FC1_L24_P12_R20 \
+  --additional-rounds 10 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --candidate-tournament-k 1 \
+  --final-dispatch \
+  --dispatch-mode summary \
+  --dispatch-llm-mode required \
+  --archive-candidates 0 \
+  --device cuda \
+  --cuda-id 0
+```
+
+Continue an existing FC2 run by 10 more rounds:
+
+```bash
+python -m forge.cli continue \
+  --run-dir runs/pilot_trust_summary_FC2_L24_P12_R20 \
+  --additional-rounds 10 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --candidate-tournament-k 1 \
+  --final-dispatch \
+  --dispatch-mode summary \
+  --dispatch-llm-mode required \
+  --archive-candidates 0 \
+  --device cuda \
+  --cuda-id 0
+```
+
+Continue to an absolute final iteration index, for example `iter_050`:
+
+```bash
+python -m forge.cli continue \
+  --run-dir runs/pilot_trust_summary_FC1_L24_P12_R20 \
+  --to-round 50 \
+  --epochs 200 \
+  --llm-mode required \
+  --routing-mode trust \
+  --parent-policy best \
+  --candidate-tournament-k 1 \
+  --final-dispatch \
+  --dispatch-mode summary \
+  --dispatch-llm-mode required \
+  --archive-candidates 0 \
+  --device cuda \
+  --cuda-id 0
+```
+
+Refresh one completed run without retraining:
+
+```bash
+python -m forge.cli summarize-run --run-dir runs/pilot_trust_summary_FC1_L24_P12_R20
+```
+
+The refreshed summary prints both the paper target and the FORGE best result:
+
+```text
+[FORGE] FORGE best: iter_016 MAE=4.2593 MSE=8.9407
+[FORGE] Remaining gap to paper target: MAE=0.0000 MSE=0.0000 total=0.0000
+[FORGE] FORGE vs paper target: improvement over paper target MAE=10.52% MSE=6.77%
+```
+
+`Remaining gap` is clipped at zero because lower MAE/MSE is better. The
+improvement percentage is `(paper_target - FORGE) / paper_target * 100`.
+
+## Command Modes
+
+Use `run` when you want a new independent experiment. It creates a new run
+directory, copies `workspace/initial_model.py` to `iter_000/model.py`, evaluates
+`iter_000`, and then creates/evaluates new iterations up to `iter_N`.
+For a true fresh rerun, use a new `--run-name` or an empty `--run-dir`; do not
+reuse an old run directory.
+
+Use `continue` when you want to extend an existing run. It reuses the existing
+`run_config.json`, model versions, feedback vectors, routing records,
+`task_graph.json`, and previous patch artifacts. This is the right command when
+you say "在这个数据集已有结果基础上继续跑".
+
+Use `sweep` when you want a grid of datasets/history lengths/horizons. It
+creates one child run per combination, for example `FC1_L24_P12` and
+`FC2_L24_P12`.
+
+Use `summarize-run` or `summarize-sweep` when you only want to refresh reports
+and evidence metrics. These commands do not train or call the LLM.
+
+Use `dispatch` when you want to run only the final evidence summary over an
+already completed run. In the main protocol, this is normally handled by
+`--final-dispatch`.
+
+## Parameter Reference
+
+| Parameter | Values / Range | Recommended | Meaning |
+| --- | --- | --- | --- |
+| `--data` | `FC1`, `FC2` | run both separately | PEMFC dataset/cell. |
+| `--seq-len` | `12`, `24`, `48`, `96`, `192` | `24` for pilot | Historical input length. |
+| `--pred-len` | `1`, `3`, `6`, `12` | `12` for L24-P12 | Forecast horizon. |
+| `--rounds` | integer `>=0` | `20` first, then maybe `50` | For `run`; final iteration index to create from scratch. `--rounds 20` evaluates `iter_000` through `iter_020`. |
+| `--additional-rounds` | integer `>0` | `10` | For `continue`; add this many new iterations after the current last iteration. |
+| `--to-round` | integer greater than current last iteration | `50` for full continuation | For `continue`; absolute final iteration index, e.g. `--to-round 50` finishes at `iter_050`. |
+| `--epochs` | integer `>0` | `200` official, `5` smoke | Max epochs per harness training run. Early stopping may stop earlier. |
+| `--batch-size` | integer `>0` | `128` | Training batch size. |
+| `--lr` | float `>0` | `0.001` | Learning rate. |
+| `--patience` | integer `>0` | `5` | Early-stopping patience. |
+| `--seed` | integer | `2025` | Random seed for harness training. |
+| `--device` | `cuda`, `cpu`, `auto` | `cuda` | Runtime device. |
+| `--cuda-id` | visible CUDA index | `0` | GPU id when using CUDA. |
+| `--llm-mode` | `required`, `auto`, `off` | `required` official | LLM patch mode. `off` is only for smoke tests. |
+| `--routing-mode` | `trust`, `prior`, `rule`, `trust-action` | `trust` | Feedback routing policy. |
+| `--parent-policy` | `best`, `last` | `best` | Parent model selection. `best` protects best-so-far while still learning from failed attempts. |
+| `--candidate-tournament-k` | currently must be `1` | `1` | Stable FORGE executes one candidate per round. Larger K is reserved for a future budgeted tournament implementation. |
+| `--final-dispatch` | flag | enabled for official runs | Runs final evidence summary after iterations. |
+| `--dispatch-mode` | `summary`, `candidates` | `summary` | Summary-only is the main path. `candidates` is an ablation. |
+| `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence summary. |
+| `--archive-candidates` | integer `>=0` | `0` | Historical model promotion candidates. Keep `0` for the main method. |
+| `--run-name` | string | descriptive name | Creates `runs/<run-name>`. Use a new name for a fresh run. |
+| `--run-dir` | path | existing path for `continue` | Existing run directory for continuation or report refresh. |
+| `--scaling` | `baseline`, `train` | `baseline` | Data scaling protocol. Keep `baseline` for Ms-AeDNet-compatible reporting. |
+| `--limit-rows` | integer or omitted | omit | Debug-only row limit. Do not use for official results. |
+
+## When To Continue
+
+Continue by 10 rounds if one of these is true:
+
+- `best_iteration` is equal to the current last iteration.
+- `best_iteration` is within the last 3-5 iterations.
+- `evidence_audit.metrics.improvement_rate` is still nonzero.
+- The latest summary says FORGE is improving but still has positive
+  `Remaining gap to paper target`.
+
+Stop or switch to another seed/run if:
+
+- the best iteration is far behind the current last iteration,
+- repeated useless edit rate keeps rising,
+- invalid edit rate is high,
+- or several continuations do not improve `best_metrics.paper_mae` or
+  `best_metrics.paper_mse`.
 
 ## Evidence Dispatch
 
@@ -120,6 +296,40 @@ python -m forge.cli sweep \
   --dispatch-mode summary \
   --dispatch-llm-mode required \
   --archive-candidates 0
+```
+
+## Method Framework
+
+FORGE is organized as four explicit modules:
+
+- **PEMFC-native diagnostic harness**: fixed data protocol, train/validation/test
+  split, paper-scaled metrics, diagnostic probes, invalid patch detection, and
+  component-change summaries. The LLM only sees structured harness evidence.
+- **Evidence reconstruction graph**: feedback, component, edit, and outcome nodes
+  connected by execution-calibrated evidence rather than semantic similarity.
+- **Test-time adaptive strategy memory**: per-run policy state records current
+  failure hypotheses, proven ineffective edits, trusted components, forbidden
+  repeats, and the expected improvement metric.
+- **K-candidate evidence tournament**: a budgeted candidate competition contract.
+  The validated main line currently enforces `--candidate-tournament-k 1`; larger
+  K should be implemented and reported as a separate budgeted extension rather
+  than silently mixed into the main result.
+
+Run summaries include `method_framework` and `evidence_audit` so the final
+result is not judged only by MAE/RMSE. The audit reports:
+
+- `improvement_rate`
+- `invalid_edit_rate`
+- `repeated_useless_edit_rate`
+- `routing_stability`
+- `evidence_alignment`
+- `budget_efficiency`
+- sweep-level `cross_cell_robustness`
+
+Refresh these fields for an existing run without retraining:
+
+```bash
+python -m forge.cli summarize-run --run-dir runs/<run_name>
 ```
 
 ## Trust Routing And Ablations
@@ -208,6 +418,7 @@ Runs are written under `runs/<run_name>/`:
 - `task_graph.json`: evolving component graph state and feedback-component trust relations
 - `graph_events.jsonl`: append-only orchestration event log
 - `summary.json`: run-level summary
+- `summary.json/evidence_audit`: trustworthy feedback-routing metrics and adaptive strategy memory
 - `evidence_dispatch*/dispatch_summary.json`: protected best, mined motifs, summary report, and final model path
 
 ## Graph Orchestration

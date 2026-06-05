@@ -13,6 +13,7 @@ from typing import Any
 
 from .assets import ensure_ms_aednet_data
 from .config import load_experiment_config, load_json, save_json
+from .evidence import build_run_evidence_audit, method_framework
 from .feedback import encode_feedback
 from .harness import HarnessConfig, run_harness
 from .harness_spec import (
@@ -489,11 +490,15 @@ def _write_run_summary(
     rounds: int,
     target_metric: str,
     history: list[dict[str, Any]],
+    graph_state: dict[str, Any] | None = None,
+    hcfg: HarnessConfig | None = None,
+    candidate_tournament_k: int = 1,
 ) -> dict[str, Any]:
     summary = {
         "run_root": str(run_root),
         "rounds": rounds,
         "target_metric": target_metric,
+        "method_framework": method_framework(candidate_tournament_k),
         "history": [
             {
                 "iteration": row["iteration"],
@@ -505,12 +510,63 @@ def _write_run_summary(
             for row in history
         ],
     }
+    if hcfg is not None:
+        summary["paper_baseline"] = _load_paper_baseline(hcfg)
     best = _best_result(history, target_metric)
     if best:
+        best_row = next(
+            (row for row in history if row.get("result") is best),
+            None,
+        )
+        if best_row is None:
+            best_row = _best_history_row(history, target_metric)
+        if best_row is not None:
+            summary["best_iteration"] = int(best_row["iteration"])
         summary["best_target"] = best.get("metrics", {}).get("target", {}).get(target_metric)
         summary["best_run_dir"] = best.get("run_dir")
+        summary["best_metrics"] = _paper_metric_summary(best)
+        summary["paper_gap"] = _paper_positive_gap(best, summary.get("paper_baseline"))
+        summary["paper_delta"] = _paper_target_delta(best, summary.get("paper_baseline"))
+    summary["evidence_audit"] = build_run_evidence_audit(
+        graph_state or {},
+        history,
+        target_metric,
+        candidate_tournament_k=candidate_tournament_k,
+    )
     save_json(summary, run_root / "summary.json")
     return summary
+
+
+def _format_metric(value: Any) -> str:
+    numeric = _safe_metric(value, float("inf"))
+    if not math.isfinite(numeric):
+        return "nan"
+    return f"{numeric:.4f}"
+
+
+def _print_forge_best_summary(summary: dict[str, Any], label: str = "FORGE best") -> None:
+    metrics = summary.get("best_metrics") or {}
+    paper_mae = metrics.get("paper_mae")
+    paper_mse = metrics.get("paper_mse")
+    iteration = summary.get("best_iteration")
+    if paper_mae is None or paper_mse is None:
+        return
+    iter_text = f"iter_{int(iteration):03d}" if iteration is not None else "unknown_iter"
+    print(
+        f"[FORGE] {label}: {iter_text} "
+        f"MAE={_format_metric(paper_mae)} MSE={_format_metric(paper_mse)}"
+    )
+    paper_gap = summary.get("paper_gap") or {}
+    if paper_gap:
+        print(
+            "[FORGE] Remaining gap to paper target: "
+            f"MAE={_format_metric(paper_gap.get('mae'))} "
+            f"MSE={_format_metric(paper_gap.get('mse'))} "
+            f"total={_format_metric(paper_gap.get('total'))}"
+        )
+    paper_delta = summary.get("paper_delta") or {}
+    if paper_delta:
+        print(_format_paper_delta_line("FORGE vs paper target", paper_delta))
 
 
 def _safe_metric(value: Any, default: float = float("inf")) -> float:
@@ -593,6 +649,52 @@ def _paper_positive_gap(result: dict[str, Any], paper_baseline: dict[str, float]
     mae_gap = max(0.0, _paper_mae_value(result) - float(paper_baseline["mae"]))
     mse_gap = max(0.0, _paper_mse_value(result) - float(paper_baseline["mse"]))
     return {"mae": mae_gap, "mse": mse_gap, "total": mae_gap + mse_gap}
+
+
+def _paper_target_delta(result: dict[str, Any], paper_baseline: dict[str, float] | None) -> dict[str, Any]:
+    if not paper_baseline:
+        return {}
+    baseline_mae = float(paper_baseline["mae"])
+    baseline_mse = float(paper_baseline["mse"])
+    forge_mae = _paper_mae_value(result)
+    forge_mse = _paper_mse_value(result)
+    mae_delta = forge_mae - baseline_mae
+    mse_delta = forge_mse - baseline_mse
+    mae_improvement_pct = ((baseline_mae - forge_mae) / baseline_mae * 100.0) if baseline_mae else 0.0
+    mse_improvement_pct = ((baseline_mse - forge_mse) / baseline_mse * 100.0) if baseline_mse else 0.0
+    return {
+        "mae": mae_delta,
+        "mse": mse_delta,
+        "total": mae_delta + mse_delta,
+        "mae_improvement_pct": mae_improvement_pct,
+        "mse_improvement_pct": mse_improvement_pct,
+        "mean_improvement_pct": (mae_improvement_pct + mse_improvement_pct) / 2.0,
+        "beats_mae": mae_delta < 0,
+        "beats_mse": mse_delta < 0,
+        "beats_both": mae_delta < 0 and mse_delta < 0,
+        "note": (
+            "Signed delta is FORGE paper-scaled metric minus paper target; negative means FORGE is better. "
+            "Improvement percent is (paper_target - FORGE) / paper_target * 100; positive means FORGE is better."
+        ),
+    }
+
+
+def _format_paper_delta_line(label: str, delta: dict[str, Any]) -> str:
+    mae_delta = _safe_metric(delta.get("mae"), 0.0)
+    mse_delta = _safe_metric(delta.get("mse"), 0.0)
+    mae_pct = _safe_metric(delta.get("mae_improvement_pct"), 0.0)
+    mse_pct = _safe_metric(delta.get("mse_improvement_pct"), 0.0)
+    if bool(delta.get("beats_both")):
+        return (
+            f"[FORGE] {label}: improvement over paper target "
+            f"MAE={mae_pct:.2f}% MSE={mse_pct:.2f}% "
+            f"(absolute better by MAE={_format_metric(abs(mae_delta))} MSE={_format_metric(abs(mse_delta))})"
+        )
+    return (
+        f"[FORGE] {label}: improvement_pct "
+        f"MAE={mae_pct:.2f}% MSE={mse_pct:.2f}% "
+        f"(signed_delta MAE={_format_metric(mae_delta)} MSE={_format_metric(mse_delta)}; negative delta is better)"
+    )
 
 
 def _load_paper_baseline(
@@ -1316,6 +1418,10 @@ def _compact_dispatch_report_payload(payload: dict[str, Any], max_motifs: int = 
         "protected_best": payload.get("protected_best"),
         "paper_baseline": payload.get("paper_baseline"),
         "evidence_scope": payload.get("evidence_scope"),
+        "evidence_audit": {
+            "metrics": (payload.get("evidence_audit") or {}).get("metrics", {}),
+            "strategy_memory": (payload.get("evidence_audit") or {}).get("strategy_memory", {}),
+        },
         "trajectory_evidence": {
             "accepted_improvements": (evidence.get("accepted_improvements") or [])[:8],
             "rejected_or_failed_attempts": (evidence.get("rejected_or_failed_attempts") or [])[:8],
@@ -1410,6 +1516,7 @@ def _write_sweep_outputs(rows: list[dict[str, Any]], sweep_root: Path, target_me
         "target_metric": target_metric,
         "count": len(rows),
         "rows": rows,
+        "cross_cell_robustness": _cross_cell_robustness(rows),
     }
     save_json(summary, sweep_root / "sweep_summary.json")
 
@@ -1420,6 +1527,14 @@ def _write_sweep_outputs(rows: list[dict[str, Any]], sweep_root: Path, target_me
         "pred_len",
         "success",
         "best_target",
+        "best_iteration",
+        "best_paper_mae",
+        "best_paper_mse",
+        "improvement_rate",
+        "invalid_edit_rate",
+        "repeated_useless_edit_rate",
+        "routing_stability",
+        "evidence_alignment",
         "best_run_dir",
         "run_root",
         "error",
@@ -1429,6 +1544,58 @@ def _write_sweep_outputs(rows: list[dict[str, Any]], sweep_root: Path, target_me
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def _compact_evidence_metrics(summary: dict[str, Any]) -> dict[str, Any]:
+    metrics = (summary.get("evidence_audit") or {}).get("metrics") or {}
+    return {
+        "improvement_rate": metrics.get("improvement_rate"),
+        "invalid_edit_rate": metrics.get("invalid_edit_rate"),
+        "repeated_useless_edit_rate": metrics.get("repeated_useless_edit_rate"),
+        "routing_stability": metrics.get("routing_stability"),
+        "evidence_alignment": metrics.get("evidence_alignment"),
+    }
+
+
+def _attach_summary_metrics_to_sweep_row(row: dict[str, Any], summary: dict[str, Any]) -> None:
+    best_metrics = summary.get("best_metrics") or {}
+    row["best_iteration"] = summary.get("best_iteration")
+    row["best_paper_mae"] = best_metrics.get("paper_mae")
+    row["best_paper_mse"] = best_metrics.get("paper_mse")
+    row["evidence_metrics"] = _compact_evidence_metrics(summary)
+    row.update(row["evidence_metrics"])
+
+
+def _cross_cell_robustness(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    successful = [row for row in rows if row.get("success")]
+    by_dataset = {
+        str(row.get("dataset")): set(
+            item.get("component")
+            for item in ((row.get("evidence_audit") or {}).get("strategy_memory") or {}).get("trusted_components", [])
+            if item.get("component")
+        )
+        for row in successful
+    }
+    if len(by_dataset) < 2:
+        return {"available": False, "reason": "requires_at_least_two_successful_datasets"}
+    datasets = sorted(by_dataset)
+    scores = []
+    pairs = []
+    for left_index, left in enumerate(datasets):
+        for right in datasets[left_index + 1 :]:
+            a = by_dataset[left]
+            b = by_dataset[right]
+            union = a | b
+            score = len(a & b) / len(union) if union else 0.0
+            scores.append(score)
+            pairs.append({"left": left, "right": right, "trusted_component_jaccard": score})
+    return {
+        "available": True,
+        "datasets": datasets,
+        "trusted_components_by_dataset": {key: sorted(value) for key, value in by_dataset.items()},
+        "mean_trusted_component_jaccard": sum(scores) / len(scores) if scores else 0.0,
+        "pairs": pairs,
+    }
 
 
 def _collect_sweep_rows(sweep_root: Path, target_metric: str) -> list[dict[str, Any]]:
@@ -1443,6 +1610,9 @@ def _collect_sweep_rows(sweep_root: Path, target_metric: str) -> list[dict[str, 
             "pred_len": int(match.group("pred_len")),
             "success": False,
             "best_target": None,
+            "best_iteration": None,
+            "best_paper_mae": None,
+            "best_paper_mse": None,
             "best_run_dir": None,
             "run_root": str(child),
             "error": None,
@@ -1453,6 +1623,8 @@ def _collect_sweep_rows(sweep_root: Path, target_metric: str) -> list[dict[str, 
             row["success"] = True
             row["best_target"] = summary.get("best_target")
             row["best_run_dir"] = summary.get("best_run_dir")
+            row["evidence_audit"] = summary.get("evidence_audit")
+            _attach_summary_metrics_to_sweep_row(row, summary)
         else:
             graph_path = child / "task_graph.json"
             if graph_path.exists():
@@ -1504,6 +1676,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     llm_mode = args.llm_mode or exp_cfg["evolution"]["llm_mode"]
     parent_policy = args.parent_policy or "best"
     routing_mode = args.routing_mode or "trust"
+    if int(getattr(args, "candidate_tournament_k", 1)) != 1:
+        raise ValueError("Stable FORGE currently executes one candidate per round; keep --candidate-tournament-k 1")
     hcfg = _harness_config_from_args(args, exp_cfg)
 
     run_name = args.run_name or f"forge_{_timestamp()}"
@@ -1513,7 +1687,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "experiment_config": exp_cfg,
             "harness_config": hcfg.__dict__,
-            "runtime": {"parent_policy": parent_policy, "routing_mode": routing_mode},
+            "runtime": {
+                "parent_policy": parent_policy,
+                "routing_mode": routing_mode,
+                "candidate_tournament_k": int(getattr(args, "candidate_tournament_k", 1)),
+            },
         },
         run_root / "run_config.json",
     )
@@ -1630,11 +1808,20 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             orchestrator.record_artifact(iteration, "report", report_path)
         orchestrator.finish_iteration(iteration)
 
-    summary = _write_run_summary(run_root, rounds, target_metric, history)
+    summary = _write_run_summary(
+        run_root,
+        rounds,
+        target_metric,
+        history,
+        graph_state=orchestrator.state,
+        hcfg=hcfg,
+        candidate_tournament_k=int(getattr(args, "candidate_tournament_k", 1)),
+    )
     dispatch_summary = _maybe_run_final_dispatch(args, run_root, target_metric)
     if dispatch_summary:
         summary["final_dispatch"] = _compact_dispatch_summary(dispatch_summary)
         save_json(summary, run_root / "summary.json")
+    _print_forge_best_summary(summary)
     print(f"[FORGE] Finished. Summary: {run_root / 'summary.json'}")
     return summary
 
@@ -1680,6 +1867,8 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
     run_root, _exp_cfg, hcfg, target_metric, llm_mode = _load_continue_run(args)
     parent_policy = args.parent_policy or "best"
     routing_mode = args.routing_mode or "trust"
+    if int(getattr(args, "candidate_tournament_k", 1)) != 1:
+        raise ValueError("Stable FORGE currently executes one candidate per round; keep --candidate-tournament-k 1")
     orchestrator = GraphOrchestrator.open(run_root)
     history = orchestrator.history_rows(target_metric)
     _attach_saved_feedback_and_routes(orchestrator, history)
@@ -1860,7 +2049,15 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         orchestrator.finish_iteration(next_iteration)
         current_iteration = next_iteration
 
-    summary = _write_run_summary(run_root, to_round, target_metric, history)
+    summary = _write_run_summary(
+        run_root,
+        to_round,
+        target_metric,
+        history,
+        graph_state=orchestrator.state,
+        hcfg=hcfg,
+        candidate_tournament_k=int(getattr(args, "candidate_tournament_k", 1)),
+    )
     refreshed_sweep = _maybe_refresh_parent_sweep_summary(run_root, target_metric)
     dispatch_summary = _maybe_run_final_dispatch(args, run_root, target_metric)
     if dispatch_summary:
@@ -1868,6 +2065,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         save_json(summary, run_root / "summary.json")
     orchestrator.event("continue_finished", {"to_round": to_round})
     orchestrator.save()
+    _print_forge_best_summary(summary)
     print(f"[FORGE] Continue finished. Summary: {run_root / 'summary.json'}")
     if refreshed_sweep is not None:
         print(f"[FORGE] Parent sweep summary refreshed: {refreshed_sweep / 'sweep_summary.json'}")
@@ -2138,6 +2336,12 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "total_mined": 0,
             "candidates": [],
         }
+    evidence_audit = build_run_evidence_audit(
+        orchestrator.state,
+        history,
+        target_metric,
+        candidate_tournament_k=max(1, dispatch_candidate_limit or 1),
+    )
     payload = {
         "dispatch_objective": (
             "Summarize current-run PEMFC refinement evidence and keep the protected best "
@@ -2150,6 +2354,8 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             )
         ),
         "dispatch_mode": dispatch_mode,
+        "method_framework": evidence_audit.get("method_framework"),
+        "evidence_audit": evidence_audit,
         "protected_best": {
             "iteration": protected_iteration,
             "model_path": str(protected_model_path),
@@ -2199,6 +2405,23 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         print("[FORGE] No Ms-AeDNet paper target found; falling back to protected non-regression acceptance.")
+    protected_metrics = _paper_metric_summary(protected_result)
+    print(
+        f"[FORGE] FORGE protected best: iter_{protected_iteration:03d} "
+        f"MAE={_format_metric(protected_metrics.get('paper_mae'))} "
+        f"MSE={_format_metric(protected_metrics.get('paper_mse'))}"
+    )
+    protected_gap = _paper_positive_gap(protected_result, paper_baseline)
+    if protected_gap:
+        print(
+            "[FORGE] FORGE remaining gap to paper target: "
+            f"MAE={_format_metric(protected_gap.get('mae'))} "
+            f"MSE={_format_metric(protected_gap.get('mse'))} "
+            f"total={_format_metric(protected_gap.get('total'))}"
+        )
+    protected_delta = _paper_target_delta(protected_result, paper_baseline)
+    if protected_delta:
+        print(_format_paper_delta_line("FORGE protected best vs paper target", protected_delta))
 
     if dispatch_mode == "summary":
         report_payload = _compact_dispatch_report_payload(payload)
@@ -2226,11 +2449,13 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "target_metric": target_metric,
             "evidence_scope": str(args.evidence_scope),
             "paper_baseline": paper_baseline,
+            "evidence_audit": evidence_audit,
             "protected_best": {
                 "iteration": protected_iteration,
                 "model_path": str(protected_model_path),
                 "metrics": _paper_metric_summary(protected_result),
                 "paper_gap": _paper_positive_gap(protected_result, paper_baseline),
+                "paper_delta": _paper_target_delta(protected_result, paper_baseline),
             },
             "motif_library": {
                 "sources": motif_library["sources"],
@@ -2399,11 +2624,13 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "target_metric": target_metric,
         "evidence_scope": str(args.evidence_scope),
         "paper_baseline": paper_baseline,
+        "evidence_audit": evidence_audit,
         "protected_best": {
             "iteration": protected_iteration,
             "model_path": str(protected_model_path),
             "metrics": _paper_metric_summary(protected_result),
             "paper_gap": _paper_positive_gap(protected_result, paper_baseline),
+            "paper_delta": _paper_target_delta(protected_result, paper_baseline),
         },
         "motif_library": {
             "sources": motif_library["sources"],
@@ -2447,6 +2674,7 @@ def _compact_dispatch_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "final_model_path": summary.get("final_model_path"),
         "dispatch_report_path": summary.get("dispatch_report_path"),
         "protected_best": summary.get("protected_best"),
+        "evidence_metrics": ((summary.get("evidence_audit") or {}).get("metrics") or {}),
     }
 
 
@@ -2529,6 +2757,9 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     "pred_len": int(pred_len),
                     "success": False,
                     "best_target": None,
+                    "best_iteration": None,
+                    "best_paper_mae": None,
+                    "best_paper_mse": None,
                     "best_run_dir": None,
                     "run_root": combo_args.run_dir,
                     "error": None,
@@ -2538,6 +2769,8 @@ def cmd_sweep(args: argparse.Namespace) -> None:
                     row["success"] = True
                     row["best_target"] = summary.get("best_target")
                     row["best_run_dir"] = summary.get("best_run_dir")
+                    row["evidence_audit"] = summary.get("evidence_audit")
+                    _attach_summary_metrics_to_sweep_row(row, summary)
                     if summary.get("final_dispatch"):
                         row["final_dispatch"] = summary.get("final_dispatch")
                 except Exception as exc:
@@ -2563,6 +2796,34 @@ def cmd_summarize_sweep(args: argparse.Namespace) -> None:
 
     _refresh_sweep_summary(sweep_root, target_metric)
     print(f"[FORGE] Sweep summary refreshed: {sweep_root / 'sweep_summary.json'}")
+
+
+def cmd_summarize_run(args: argparse.Namespace) -> dict[str, Any]:
+    run_root, _exp_cfg, hcfg, target_metric, _llm_mode = _load_continue_run(args)
+    if int(getattr(args, "candidate_tournament_k", 1)) != 1:
+        raise ValueError("Stable FORGE currently executes one candidate per round; keep --candidate-tournament-k 1")
+    previous_summary = load_json(run_root / "summary.json") if (run_root / "summary.json").exists() else {}
+    orchestrator = GraphOrchestrator.open(run_root)
+    history = orchestrator.history_rows(target_metric)
+    _attach_saved_feedback_and_routes(orchestrator, history)
+    if not history:
+        raise RuntimeError(f"No completed iterations found in {run_root}")
+    last_iteration = max(int(row["iteration"]) for row in history)
+    summary = _write_run_summary(
+        run_root,
+        last_iteration,
+        target_metric,
+        history,
+        graph_state=orchestrator.state,
+        hcfg=hcfg,
+        candidate_tournament_k=int(getattr(args, "candidate_tournament_k", 1)),
+    )
+    if previous_summary.get("final_dispatch"):
+        summary["final_dispatch"] = previous_summary["final_dispatch"]
+        save_json(summary, run_root / "summary.json")
+    _print_forge_best_summary(summary)
+    print(f"[FORGE] Run summary refreshed: {run_root / 'summary.json'}")
+    return summary
 
 
 def _add_final_dispatch_args(parser: argparse.ArgumentParser) -> None:
@@ -2595,6 +2856,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     run_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
     run_p.add_argument("--routing-mode", choices=["trust", "trust-action", "prior", "rule"], default="trust")
+    run_p.add_argument("--candidate-tournament-k", type=int, default=1)
     run_p.add_argument("--target-metric", default=None)
     run_p.add_argument("--data", choices=sorted(get_dataset_files()), default=None)
     run_p.add_argument("--data-path", default=None)
@@ -2628,6 +2890,7 @@ def build_parser() -> argparse.ArgumentParser:
     continue_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     continue_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
     continue_p.add_argument("--routing-mode", choices=["trust", "trust-action", "prior", "rule"], default="trust")
+    continue_p.add_argument("--candidate-tournament-k", type=int, default=1)
     continue_p.add_argument("--target-metric", default=None)
     continue_p.add_argument("--epochs", type=int, default=None)
     continue_p.add_argument("--batch-size", type=int, default=None)
@@ -2678,6 +2941,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     sweep_p.add_argument("--parent-policy", choices=["best", "last"], default="best")
     sweep_p.add_argument("--routing-mode", choices=["trust", "trust-action", "prior", "rule"], default="trust")
+    sweep_p.add_argument("--candidate-tournament-k", type=int, default=1)
     sweep_p.add_argument("--target-metric", default=None)
     sweep_p.add_argument("--datasets", nargs="+", choices=sorted(get_dataset_files()), default=None)
     sweep_p.add_argument("--seq-lens", nargs="+", type=int, default=None)
@@ -2697,6 +2961,14 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_p.add_argument("--dropout", type=float, default=None)
     _add_final_dispatch_args(sweep_p)
     sweep_p.set_defaults(func=cmd_sweep)
+
+    summarize_run_p = sub.add_parser("summarize-run", help="refresh one completed run summary without training")
+    summarize_run_p.add_argument("--experiment-config", default=str(CONFIG_DIR / "forge_experiment.yaml"))
+    summarize_run_p.add_argument("--run-dir", required=True)
+    summarize_run_p.add_argument("--target-metric", default=None)
+    summarize_run_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
+    summarize_run_p.add_argument("--candidate-tournament-k", type=int, default=1)
+    summarize_run_p.set_defaults(func=cmd_summarize_run)
 
     summarize_p = sub.add_parser("summarize-sweep", help="refresh sweep summary from child run summaries")
     summarize_p.add_argument("--sweep-dir", required=True)

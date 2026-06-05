@@ -7,6 +7,8 @@ from forge.cli import (
     _accept_dispatch_candidate,
     _dispatch_patch_quality,
     _maybe_refresh_parent_sweep_summary,
+    _paper_positive_gap,
+    _paper_target_delta,
     _parent_baseline_for_patch,
     _resolve_continue_target,
     build_parser,
@@ -88,9 +90,12 @@ def test_sweep_parser_accepts_trust_action_ablation_mode():
             "off",
             "--routing-mode",
             "trust-action",
+            "--candidate-tournament-k",
+            "1",
         ]
     )
     assert args.routing_mode == "trust-action"
+    assert args.candidate_tournament_k == 1
 
 
 def test_dispatch_parser_accepts_protected_evidence_dispatch():
@@ -272,6 +277,27 @@ def test_dispatch_candidate_accepts_ms_aednet_gap_shrink():
     assert decision["paper_gap_decision"]["gap_delta"]["total"] > 0
 
 
+def test_paper_gap_zero_when_forge_beats_target_but_signed_delta_is_negative():
+    result = {
+        "success": True,
+        "metrics": {
+            "paper_scaled": {"mae": 4.2593, "mse": 8.9407},
+            "target": {"mae_inverse": 0.042593},
+        },
+    }
+    baseline = {"method": "Ms-AeDNet", "mae": 4.76, "mse": 9.59}
+
+    gap = _paper_positive_gap(result, baseline)
+    delta = _paper_target_delta(result, baseline)
+
+    assert gap == {"mae": 0.0, "mse": 0.0, "total": 0.0}
+    assert delta["mae"] < 0
+    assert delta["mse"] < 0
+    assert delta["beats_both"] is True
+    assert delta["mae_improvement_pct"] == pytest.approx(10.5189, rel=1e-4)
+    assert delta["mse_improvement_pct"] == pytest.approx(6.7706, rel=1e-4)
+
+
 def test_dispatch_candidate_rejects_probe_gain_without_ms_aednet_gap_shrink():
     protected = {
         "success": True,
@@ -386,6 +412,13 @@ def test_summarize_sweep_parser_accepts_sweep_dir():
     parser = build_parser()
     args = parser.parse_args(["summarize-sweep", "--sweep-dir", "runs/demo_sweep"])
     assert args.sweep_dir == "runs/demo_sweep"
+
+
+def test_summarize_run_parser_accepts_run_dir():
+    parser = build_parser()
+    args = parser.parse_args(["summarize-run", "--run-dir", "runs/demo"])
+    assert args.run_dir == "runs/demo"
+    assert args.candidate_tournament_k == 1
 
 
 def test_continue_refreshes_parent_sweep_summary(tmp_path):
