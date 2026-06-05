@@ -646,6 +646,81 @@ def _print_evidence_artifact_summary(summary: dict[str, Any]) -> None:
     )
 
 
+def _format_percent(value: Any) -> str:
+    numeric = _safe_metric(value, float("inf"))
+    if not math.isfinite(numeric):
+        return "nan"
+    return f"{numeric * 100.0:.2f}%"
+
+
+def _format_signed_percent(value: Any) -> str:
+    numeric = _safe_metric(value, float("inf"))
+    if not math.isfinite(numeric):
+        return "nan"
+    return f"{numeric:.2f}%"
+
+
+def _top_trusted_components(summary: dict[str, Any], limit: int = 3) -> str:
+    trusted = ((summary.get("evidence_audit") or {}).get("strategy_memory") or {}).get("trusted_components") or []
+    items = []
+    for row in trusted[:limit]:
+        component = row.get("component")
+        if not component:
+            continue
+        success_count = row.get("success_count", 0)
+        attempt_count = row.get("attempt_count", 0)
+        items.append(f"{component}({success_count}/{attempt_count})")
+    return ", ".join(items) if items else "none"
+
+
+def _print_key_value_table(title: str, rows: list[tuple[str, Any]]) -> None:
+    clean_rows = [(str(key), str(value)) for key, value in rows]
+    if not clean_rows:
+        return
+    key_width = max(len("Item"), *(len(key) for key, _value in clean_rows))
+    value_width = max(len("Value"), *(len(value) for _key, value in clean_rows))
+    border = f"+-{'-' * key_width}-+-{'-' * value_width}-+"
+    print(f"[FORGE] {title}")
+    print(border)
+    print(f"| {'Item'.ljust(key_width)} | {'Value'.ljust(value_width)} |")
+    print(border)
+    for key, value in clean_rows:
+        print(f"| {key.ljust(key_width)} | {value.ljust(value_width)} |")
+    print(border)
+
+
+def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
+    metrics = summary.get("best_metrics") or {}
+    evidence = (summary.get("evidence_audit") or {}).get("metrics") or {}
+    budget = evidence.get("budget_efficiency") or {}
+    artifacts = summary.get("evidence_artifacts") or {}
+    counts = artifacts.get("table_counts") or {}
+    delta = summary.get("paper_delta") or {}
+    best_iteration = summary.get("best_iteration")
+    best_text = f"iter_{int(best_iteration):03d}" if best_iteration is not None else "unknown"
+    rows = [
+        ("Best iteration", best_text),
+        ("Best MAE / MSE", f"{_format_metric(metrics.get('paper_mae'))} / {_format_metric(metrics.get('paper_mse'))}"),
+        (
+            "Reference improvement",
+            f"MAE {_format_signed_percent(delta.get('mae_improvement_pct'))}, "
+            f"MSE {_format_signed_percent(delta.get('mse_improvement_pct'))}",
+        ),
+        (
+            "Evidence rows",
+            f"attempts {counts.get('attempts', 0)}, relations {counts.get('relations', 0)}, components {counts.get('components', 0)}",
+        ),
+        ("Improvement rate", _format_percent(evidence.get("improvement_rate"))),
+        ("Invalid edit rate", _format_percent(evidence.get("invalid_edit_rate"))),
+        ("Repeated useless edit rate", _format_percent(evidence.get("repeated_useless_edit_rate"))),
+        ("Routing stability", _format_percent(evidence.get("routing_stability"))),
+        ("Evidence alignment", _format_percent(evidence.get("evidence_alignment"))),
+        ("Attempts to best", budget.get("attempts_to_best", "nan")),
+        ("Top trusted components", _top_trusted_components(summary)),
+    ]
+    _print_key_value_table("Concise evidence summary", rows)
+
+
 def _safe_metric(value: Any, default: float = float("inf")) -> float:
     try:
         if value is None:
@@ -1901,6 +1976,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         save_json(summary, run_root / "summary.json")
     _print_forge_best_summary(summary)
     _print_evidence_artifact_summary(summary)
+    _print_evidence_summary_table(summary)
     print(f"[FORGE] Finished. Summary: {run_root / 'summary.json'}")
     return summary
 
@@ -2146,6 +2222,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
     orchestrator.save()
     _print_forge_best_summary(summary)
     _print_evidence_artifact_summary(summary)
+    _print_evidence_summary_table(summary)
     print(f"[FORGE] Continue finished. Summary: {run_root / 'summary.json'}")
     if refreshed_sweep is not None:
         print(f"[FORGE] Parent sweep summary refreshed: {refreshed_sweep / 'sweep_summary.json'}")
@@ -2894,6 +2971,7 @@ def cmd_summarize_run(args: argparse.Namespace) -> dict[str, Any]:
         save_json(summary, run_root / "summary.json")
     _print_forge_best_summary(summary)
     _print_evidence_artifact_summary(summary)
+    _print_evidence_summary_table(summary)
     print(f"[FORGE] Run summary refreshed: {run_root / 'summary.json'}")
     return summary
 

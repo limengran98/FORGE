@@ -202,11 +202,23 @@ python -m forge.cli summarize-run --run-dir runs/pilot_trust_summary_FC1_L24_P12
 
 The summary prints the global best model from `iter_000` to the current maximum
 iteration, plus the improvement percentage against the configured reference
-target:
+target and a concise evidence table:
 
 ```text
 [FORGE] FORGE best: iter_016 MAE=4.2593 MSE=8.9407
 [FORGE] FORGE vs reference target: improvement over reference target MAE=10.52% MSE=6.77%
+[FORGE] Concise evidence summary
++----------------------------+--------------------------------------+
+| Item                       | Value                                |
++----------------------------+--------------------------------------+
+| Best iteration             | iter_016                             |
+| Best MAE / MSE             | 4.2593 / 8.9407                      |
+| Improvement rate           | 22.50%                               |
+| Invalid edit rate          | 12.50%                               |
+| Routing stability          | 61.88%                               |
+| Evidence alignment         | 100.00%                              |
+| Top trusted components     | temporal_memory(4/23), ...           |
++----------------------------+--------------------------------------+
 ```
 
 The improvement percentage is `(reference_target - FORGE) / reference_target *

@@ -11,6 +11,7 @@ from forge.cli import (
     _paper_positive_gap,
     _paper_target_delta,
     _parent_baseline_for_patch,
+    _print_evidence_summary_table,
     _print_forge_best_summary,
     _resolve_continue_target,
     _write_run_summary,
@@ -338,6 +339,40 @@ def test_print_forge_best_summary_omits_clipped_remaining_gap(capsys):
     assert "FORGE best: iter_016 MAE=4.2593 MSE=8.9407" in output
     assert "Remaining gap" not in output
     assert "improvement over reference target" in output
+
+
+def test_print_evidence_summary_table_is_readable(capsys):
+    _print_evidence_summary_table(
+        {
+            "best_iteration": 7,
+            "best_metrics": {"paper_mae": 4.12, "paper_mse": 8.34},
+            "paper_delta": {"mae_improvement_pct": 3.5, "mse_improvement_pct": -1.25},
+            "evidence_artifacts": {"table_counts": {"attempts": 10, "relations": 42, "components": 3}},
+            "evidence_audit": {
+                "metrics": {
+                    "improvement_rate": 0.3,
+                    "invalid_edit_rate": 0.1,
+                    "repeated_useless_edit_rate": 0.2,
+                    "routing_stability": 0.75,
+                    "evidence_alignment": 1.0,
+                    "budget_efficiency": {"attempts_to_best": 7},
+                },
+                "strategy_memory": {
+                    "trusted_components": [
+                        {"component": "temporal_memory", "success_count": 2, "attempt_count": 5}
+                    ]
+                },
+            },
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "Concise evidence summary" in output
+    assert "Best iteration" in output
+    assert "iter_007" in output
+    assert "Reference improvement" in output
+    assert "MAE 3.50%, MSE -1.25%" in output
+    assert "temporal_memory(2/5)" in output
 
 
 def test_write_run_summary_selects_single_best_from_full_history(tmp_path):
