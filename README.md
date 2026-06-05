@@ -211,8 +211,12 @@ target and a concise evidence table:
 +----------------------------+--------------------------------------+
 | Item                       | Value                                |
 +----------------------------+--------------------------------------+
-| Best iteration             | iter_016                             |
-| Best MAE / MSE             | 4.2593 / 8.9407                      |
+| Target best                | iter_016: MAE 4.2593, MSE 8.9407     |
+| MAE-best                   | iter_016: MAE 4.2593 (10.52%), ...   |
+| MSE-best                   | iter_016: MAE 4.2593, MSE 8.9407     |
+| Joint-best                 | iter_016: MAE 4.2593, MSE 8.9407     |
+| Final selected model       | iter_016 (MAE 4.2593, MSE 8.9407)    |
+| Final selection policy     | auto / target_best                   |
 | Improvement rate           | 22.50%                               |
 | Invalid edit rate          | 12.50%                               |
 | Routing stability          | 61.88%                               |
@@ -223,6 +227,11 @@ target and a concise evidence table:
 
 The improvement percentage is `(reference_target - FORGE) / reference_target *
 100`. Positive means FORGE is better; negative means it is worse.
+`Best iteration` follows the configured target metric, while `Final selected
+model` is metric-aware. With the default `--final-selection-policy auto`, FORGE
+keeps the target-metric best only when both benchmark-scaled MAE and MSE are
+non-regressive; otherwise it selects the best available joint MAE/MSE model
+without changing the already completed search trajectory.
 
 ## Command Modes
 
@@ -256,6 +265,7 @@ The improvement percentage is `(reference_target - FORGE) / reference_target *
 | `--routing-mode` | `trust`, `prior`, `rule`, `trust-action` | `trust` | Feedback routing policy. |
 | `--parent-policy` | `best`, `last` | `best` | Parent model selection. |
 | `--candidate-tournament-k` | currently must be `1` | `1` | Stable FORGE executes one candidate per round. |
+| `--final-selection-policy` | `auto`, `target`, `joint`, `balanced` | `auto` | Non-destructive final model selector. `auto` keeps target best when MAE/MSE both improve, otherwise selects a joint MAE+MSE non-regressive model if available. It does not change the iteration search. |
 | `--final-dispatch` | flag | enabled for official runs | Runs final evidence summary after iterations. |
 | `--dispatch-mode` | `summary`, `candidates` | `summary` | Summary-only is the main path; candidates is an ablation. |
 | `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence summary. |

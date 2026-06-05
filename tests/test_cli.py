@@ -5,9 +5,11 @@ import pytest
 
 from forge.cli import (
     _accept_dispatch_candidate,
+    _build_metric_tradeoff_summary,
     _dispatch_patch_quality,
     _format_paper_delta_line,
     _maybe_refresh_parent_sweep_summary,
+    _metric_aware_final_row,
     _paper_positive_gap,
     _paper_target_delta,
     _parent_baseline_for_patch,
@@ -348,6 +350,20 @@ def test_print_evidence_summary_table_is_readable(capsys):
             "best_metrics": {"paper_mae": 4.12, "paper_mse": 8.34},
             "paper_delta": {"mae_improvement_pct": 3.5, "mse_improvement_pct": -1.25},
             "evidence_artifacts": {"table_counts": {"attempts": 10, "relations": 42, "components": 3}},
+            "metric_tradeoff": {
+                "verdict": "mae_mse_both_improved",
+                "best_by_mae": {
+                    "iteration": 7,
+                    "metrics": {"paper_mae": 4.12, "paper_mse": 8.34},
+                    "reference_delta": {"mae_improvement_pct": 3.5, "mse_improvement_pct": -1.25},
+                },
+                "best_by_mse": {"iteration": 5, "metrics": {"paper_mae": 4.20, "paper_mse": 8.10}},
+                "joint_reference_best": {
+                    "iteration": 6,
+                    "metrics": {"paper_mae": 4.16, "paper_mse": 8.20},
+                    "reference_delta": {"mae_improvement_pct": 2.0, "mse_improvement_pct": 1.0},
+                },
+            },
             "evidence_audit": {
                 "metrics": {
                     "improvement_rate": 0.3,
@@ -368,11 +384,93 @@ def test_print_evidence_summary_table_is_readable(capsys):
 
     output = capsys.readouterr().out
     assert "Concise evidence summary" in output
-    assert "Best iteration" in output
+    assert "Target best" in output
     assert "iter_007" in output
-    assert "Reference improvement" in output
-    assert "MAE 3.50%, MSE -1.25%" in output
+    assert "MAE-best" in output
+    assert "MAE 4.1200 (3.50%), MSE 8.3400 (-1.25%)" in output
+    assert "MSE-best" in output
+    assert "Joint-best" in output
+    assert "MAE 4.1600 (2.00%), MSE 8.2000 (1.00%)" in output
+    assert "Metric verdict" in output
+    assert "MAE and MSE both improved" in output
     assert "temporal_memory(2/5)" in output
+
+
+def test_metric_tradeoff_detects_mae_gain_mse_regression():
+    history = [
+        {
+            "iteration": 0,
+            "success": True,
+            "run_dir": "iter_000",
+            "result": {
+                "success": True,
+                "metrics": {"paper_scaled": {"mae": 4.56, "mse": 10.40}, "target": {"mae_inverse": 0.000456}},
+            },
+        },
+        {
+            "iteration": 1,
+            "success": True,
+            "run_dir": "iter_001",
+            "result": {
+                "success": True,
+                "metrics": {"paper_scaled": {"mae": 4.35, "mse": 10.44}, "target": {"mae_inverse": 0.000435}},
+            },
+        },
+        {
+            "iteration": 2,
+            "success": True,
+            "run_dir": "iter_002",
+            "result": {
+                "success": True,
+                "metrics": {"paper_scaled": {"mae": 4.45, "mse": 9.78}, "target": {"mae_inverse": 0.000445}},
+            },
+        },
+    ]
+
+    tradeoff = _build_metric_tradeoff_summary(
+        history,
+        history[1],
+        {"mae": 4.56, "mse": 10.40},
+    )
+
+    assert tradeoff["verdict"] == "mae_improved_mse_regressed"
+    assert tradeoff["selected_beats_mae"] is True
+    assert tradeoff["selected_beats_mse"] is False
+    assert tradeoff["best_by_mse"]["iteration"] == 2
+    assert tradeoff["joint_reference_best"]["iteration"] == 2
+
+
+def test_metric_aware_final_row_auto_prefers_joint_without_changing_target_best():
+    history = [
+        {
+            "iteration": 1,
+            "success": True,
+            "run_dir": "iter_001",
+            "result": {
+                "success": True,
+                "metrics": {"paper_scaled": {"mae": 4.35, "mse": 10.44}, "target": {"mae_inverse": 0.000435}},
+            },
+        },
+        {
+            "iteration": 2,
+            "success": True,
+            "run_dir": "iter_002",
+            "result": {
+                "success": True,
+                "metrics": {"paper_scaled": {"mae": 4.45, "mse": 9.78}, "target": {"mae_inverse": 0.000445}},
+            },
+        },
+    ]
+    baseline = {"mae": 4.56, "mse": 10.40}
+
+    auto_row, auto_name, auto_reason = _metric_aware_final_row(history, "mae_inverse", baseline, "auto")
+    target_row, target_name, _target_reason = _metric_aware_final_row(history, "mae_inverse", baseline, "target")
+
+    assert target_row["iteration"] == 1
+    assert target_name == "target_best"
+    assert auto_row["iteration"] == 2
+    assert auto_name == "joint_reference_best"
+    assert auto_reason == "auto_switches_to_joint_best_to_avoid_metric_tradeoff"
 
 
 def test_write_run_summary_selects_single_best_from_full_history(tmp_path):
@@ -406,6 +504,7 @@ def test_write_run_summary_selects_single_best_from_full_history(tmp_path):
     summary = _write_run_summary(tmp_path, 30, "mae_inverse", history)
 
     assert summary["best_iteration"] == 10
+    assert summary["final_selection"]["selection"] == "target_best"
     assert summary["best_selection"]["search_start_iteration"] == 0
     assert summary["best_selection"]["search_end_iteration"] == 30
     assert summary["best_selection"]["successful_candidate_count"] == 3

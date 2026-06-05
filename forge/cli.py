@@ -118,6 +118,214 @@ def _best_result(history: list[dict[str, Any]], target_metric: str) -> dict[str,
     )
 
 
+def _success_history_rows(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in history if row.get("result", {}).get("success")]
+
+
+def _selection_row_payload(row: dict[str, Any] | None, paper_baseline: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    result = row.get("result") or {}
+    metrics = _paper_metric_summary(result)
+    payload = {
+        "iteration": int(row["iteration"]),
+        "run_dir": row.get("run_dir") or result.get("run_dir"),
+        "metrics": metrics,
+    }
+    delta = _paper_target_delta(result, paper_baseline)
+    if delta:
+        payload["reference_delta"] = delta
+    return payload
+
+
+def _best_by_paper_metric(history: list[dict[str, Any]], metric: str) -> dict[str, Any] | None:
+    rows = _success_history_rows(history)
+    if not rows:
+        return None
+    if metric == "mae":
+        return min(rows, key=lambda row: _paper_mae_value(row.get("result") or {}))
+    if metric == "mse":
+        return min(rows, key=lambda row: _paper_mse_value(row.get("result") or {}))
+    raise ValueError(f"Unknown paper metric: {metric}")
+
+
+def _reference_balanced_score(result: dict[str, Any], paper_baseline: dict[str, Any]) -> float:
+    baseline_mae = _safe_metric(paper_baseline.get("mae"))
+    baseline_mse = _safe_metric(paper_baseline.get("mse"))
+    if not baseline_mae or not baseline_mse or not math.isfinite(baseline_mae) or not math.isfinite(baseline_mse):
+        return float("inf")
+    return (_paper_mae_value(result) / baseline_mae + _paper_mse_value(result) / baseline_mse) / 2.0
+
+
+def _build_metric_tradeoff_summary(
+    history: list[dict[str, Any]],
+    selected_best_row: dict[str, Any] | None,
+    paper_baseline: dict[str, Any] | None,
+) -> dict[str, Any]:
+    best_mae_row = _best_by_paper_metric(history, "mae")
+    best_mse_row = _best_by_paper_metric(history, "mse")
+    tradeoff = {
+        "selection_note": (
+            "The primary FORGE best follows target_metric. Report joint_reference_best "
+            "when both benchmark-scaled MAE and MSE must be non-regressive."
+        ),
+        "best_by_mae": _selection_row_payload(best_mae_row, paper_baseline),
+        "best_by_mse": _selection_row_payload(best_mse_row, paper_baseline),
+    }
+    if paper_baseline:
+        success_rows = _success_history_rows(history)
+        joint_rows = [
+            row
+            for row in success_rows
+            if _paper_mae_value(row.get("result") or {}) <= float(paper_baseline["mae"])
+            and _paper_mse_value(row.get("result") or {}) <= float(paper_baseline["mse"])
+        ]
+        balanced_rows = success_rows
+        joint_best = (
+            min(joint_rows, key=lambda row: _reference_balanced_score(row.get("result") or {}, paper_baseline))
+            if joint_rows
+            else None
+        )
+        balanced_best = (
+            min(balanced_rows, key=lambda row: _reference_balanced_score(row.get("result") or {}, paper_baseline))
+            if balanced_rows
+            else None
+        )
+        tradeoff["joint_reference_best"] = _selection_row_payload(joint_best, paper_baseline)
+        tradeoff["balanced_reference_best"] = _selection_row_payload(balanced_best, paper_baseline)
+        if joint_best:
+            tradeoff["joint_reference_best"]["balanced_score"] = _reference_balanced_score(
+                joint_best.get("result") or {},
+                paper_baseline,
+            )
+        if balanced_best:
+            tradeoff["balanced_reference_best"]["balanced_score"] = _reference_balanced_score(
+                balanced_best.get("result") or {},
+                paper_baseline,
+            )
+    selected_delta = (
+        _paper_target_delta((selected_best_row or {}).get("result") or {}, paper_baseline)
+        if selected_best_row and paper_baseline
+        else {}
+    )
+    tradeoff["selected_best"] = _selection_row_payload(selected_best_row, paper_baseline)
+    tradeoff["selected_beats_mae"] = bool(selected_delta.get("beats_mae")) if selected_delta else None
+    tradeoff["selected_beats_mse"] = bool(selected_delta.get("beats_mse")) if selected_delta else None
+    tradeoff["selected_beats_both"] = bool(selected_delta.get("beats_both")) if selected_delta else None
+    if selected_delta and selected_delta.get("beats_mae") and not selected_delta.get("beats_mse"):
+        tradeoff["verdict"] = "mae_improved_mse_regressed"
+    elif selected_delta and selected_delta.get("beats_both"):
+        tradeoff["verdict"] = "mae_mse_both_improved"
+    elif selected_delta:
+        tradeoff["verdict"] = "reference_not_fully_improved"
+    else:
+        tradeoff["verdict"] = "reference_unavailable"
+    return tradeoff
+
+
+def _metric_aware_final_row(
+    history: list[dict[str, Any]],
+    target_metric: str,
+    paper_baseline: dict[str, Any] | None,
+    selection_policy: str = "auto",
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Select the final reported model without changing the search trajectory."""
+
+    target_row = _best_history_row(history, target_metric)
+    if target_row is None:
+        return None, "none", "no_successful_model"
+    policy = str(selection_policy or "auto")
+    if not paper_baseline or policy == "target":
+        return target_row, "target_best", "target_metric_policy"
+
+    success_rows = _success_history_rows(history)
+    joint_rows = [
+        row
+        for row in success_rows
+        if _paper_mae_value(row.get("result") or {}) <= float(paper_baseline["mae"])
+        and _paper_mse_value(row.get("result") or {}) <= float(paper_baseline["mse"])
+    ]
+    joint_row = (
+        min(joint_rows, key=lambda row: _reference_balanced_score(row.get("result") or {}, paper_baseline))
+        if joint_rows
+        else None
+    )
+    balanced_row = (
+        min(success_rows, key=lambda row: _reference_balanced_score(row.get("result") or {}, paper_baseline))
+        if success_rows
+        else None
+    )
+
+    if policy == "joint":
+        if joint_row is not None:
+            return joint_row, "joint_reference_best", "joint_policy_requires_mae_mse_non_regression"
+        return target_row, "target_best", "joint_policy_no_joint_candidate"
+
+    if policy == "balanced":
+        if balanced_row is not None:
+            return balanced_row, "balanced_reference_best", "balanced_policy_minimizes_mean_reference_ratio"
+        return target_row, "target_best", "balanced_policy_no_candidate"
+
+    target_delta = _paper_target_delta(target_row.get("result") or {}, paper_baseline)
+    if target_delta.get("beats_both"):
+        return target_row, "target_best", "auto_keeps_target_best_when_both_metrics_improve"
+    if joint_row is not None:
+        return joint_row, "joint_reference_best", "auto_switches_to_joint_best_to_avoid_metric_tradeoff"
+    return target_row, "target_best", "auto_no_joint_candidate_available"
+
+
+def _result_model_path(row: dict[str, Any], run_root: Path) -> Path:
+    result = row.get("result") or {}
+    run_dir = result.get("run_dir") or row.get("run_dir") or ""
+    path = result.get("model_path") or result.get("paths", {}).get("model") or Path(run_dir) / "model.py"
+    return _resolve_stored_path(path, run_root)
+
+
+def _write_final_selection_artifact(
+    run_root: Path,
+    row: dict[str, Any] | None,
+    paper_baseline: dict[str, Any] | None,
+    selection_name: str,
+    reason: str,
+    policy: str,
+) -> dict[str, Any]:
+    final_dir = run_root / "final_selection"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "policy": policy,
+        "selection": selection_name,
+        "reason": reason,
+        "dir": str(final_dir),
+        "non_destructive": True,
+    }
+    if row is None:
+        save_json(payload, final_dir / "final_selection.json")
+        return payload
+
+    result = row.get("result") or {}
+    source_model_path = _result_model_path(row, run_root)
+    final_model_path = final_dir / "model.py"
+    if source_model_path.exists():
+        shutil.copy2(source_model_path, final_model_path)
+        payload["final_model_path"] = str(final_model_path)
+    else:
+        payload["final_model_path"] = None
+        payload["warning"] = f"selected model source does not exist: {source_model_path}"
+    payload.update(
+        {
+            "iteration": int(row["iteration"]),
+            "source_model_path": str(source_model_path),
+            "run_dir": row.get("run_dir") or result.get("run_dir"),
+            "metrics": _paper_metric_summary(result),
+            "reference_delta": _paper_target_delta(result, paper_baseline),
+            "selected_result_path": str(final_dir / "selected_result.json"),
+        }
+    )
+    save_json(result, final_dir / "selected_result.json")
+    save_json(payload, final_dir / "final_selection.json")
+    return payload
+
+
 def _history_row(
     iteration: int,
     result: dict[str, Any],
@@ -546,6 +754,7 @@ def _write_run_summary(
     graph_state: dict[str, Any] | None = None,
     hcfg: HarnessConfig | None = None,
     candidate_tournament_k: int = 1,
+    final_selection_policy: str = "auto",
 ) -> dict[str, Any]:
     summary = {
         "run_root": str(run_root),
@@ -566,6 +775,7 @@ def _write_run_summary(
     if hcfg is not None:
         summary["paper_baseline"] = _load_paper_baseline(hcfg)
     best = _best_result(history, target_metric)
+    best_row = None
     if best:
         best_row = next(
             (row for row in history if row.get("result") is best),
@@ -580,6 +790,21 @@ def _write_run_summary(
         summary["best_metrics"] = _paper_metric_summary(best)
         summary["paper_gap"] = _paper_positive_gap(best, summary.get("paper_baseline"))
         summary["paper_delta"] = _paper_target_delta(best, summary.get("paper_baseline"))
+    summary["metric_tradeoff"] = _build_metric_tradeoff_summary(history, best_row, summary.get("paper_baseline"))
+    final_row, final_selection_name, final_reason = _metric_aware_final_row(
+        history,
+        target_metric,
+        summary.get("paper_baseline"),
+        selection_policy=final_selection_policy,
+    )
+    summary["final_selection"] = _write_final_selection_artifact(
+        run_root,
+        final_row,
+        summary.get("paper_baseline"),
+        final_selection_name,
+        final_reason,
+        policy=str(final_selection_policy or "auto"),
+    )
     successful_iterations = [
         int(row["iteration"])
         for row in history
@@ -673,6 +898,47 @@ def _top_trusted_components(summary: dict[str, Any], limit: int = 3) -> str:
     return ", ".join(items) if items else "none"
 
 
+def _selection_summary_text(selection: dict[str, Any] | None, metric_name: str | None = None) -> str:
+    if not selection:
+        return "none"
+    iteration = selection.get("iteration")
+    metrics = selection.get("metrics") or {}
+    iter_text = f"iter_{int(iteration):03d}" if iteration is not None else "unknown"
+    mae = _format_metric(metrics.get("paper_mae"))
+    mse = _format_metric(metrics.get("paper_mse"))
+    if metric_name == "mse":
+        return f"{iter_text} (MSE {mse}, MAE {mae})"
+    if metric_name == "mae":
+        return f"{iter_text} (MAE {mae}, MSE {mse})"
+    return f"{iter_text} (MAE {mae}, MSE {mse})"
+
+
+def _selection_with_improvement_text(selection: dict[str, Any] | None) -> str:
+    if not selection:
+        return "none"
+    iteration = selection.get("iteration")
+    metrics = selection.get("metrics") or {}
+    delta = selection.get("reference_delta") or {}
+    iter_text = f"iter_{int(iteration):03d}" if iteration is not None else "unknown"
+    mae = _format_metric(metrics.get("paper_mae"))
+    mse = _format_metric(metrics.get("paper_mse"))
+    mae_pct = _format_signed_percent(delta.get("mae_improvement_pct"))
+    mse_pct = _format_signed_percent(delta.get("mse_improvement_pct"))
+    return f"{iter_text}: MAE {mae} ({mae_pct}), MSE {mse} ({mse_pct})"
+
+
+def _metric_verdict_text(summary: dict[str, Any]) -> str:
+    tradeoff = summary.get("metric_tradeoff") or {}
+    verdict = tradeoff.get("verdict")
+    if verdict == "mae_mse_both_improved":
+        return "MAE and MSE both improved"
+    if verdict == "mae_improved_mse_regressed":
+        return "MAE improved, MSE regressed"
+    if verdict == "reference_not_fully_improved":
+        return "reference not fully improved"
+    return "reference unavailable"
+
+
 def _print_key_value_table(title: str, rows: list[tuple[str, Any]]) -> None:
     clean_rows = [(str(key), str(value)) for key, value in rows]
     if not clean_rows:
@@ -696,16 +962,18 @@ def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
     artifacts = summary.get("evidence_artifacts") or {}
     counts = artifacts.get("table_counts") or {}
     delta = summary.get("paper_delta") or {}
+    tradeoff = summary.get("metric_tradeoff") or {}
+    final_selection = summary.get("final_selection") or {}
     best_iteration = summary.get("best_iteration")
     best_text = f"iter_{int(best_iteration):03d}" if best_iteration is not None else "unknown"
     rows = [
-        ("Best iteration", best_text),
-        ("Best MAE / MSE", f"{_format_metric(metrics.get('paper_mae'))} / {_format_metric(metrics.get('paper_mse'))}"),
-        (
-            "Reference improvement",
-            f"MAE {_format_signed_percent(delta.get('mae_improvement_pct'))}, "
-            f"MSE {_format_signed_percent(delta.get('mse_improvement_pct'))}",
-        ),
+        ("Target best", f"{best_text}: MAE {_format_metric(metrics.get('paper_mae'))}, MSE {_format_metric(metrics.get('paper_mse'))}"),
+        ("MAE-best", _selection_with_improvement_text(tradeoff.get("best_by_mae"))),
+        ("MSE-best", _selection_with_improvement_text(tradeoff.get("best_by_mse"))),
+        ("Joint-best", _selection_with_improvement_text(tradeoff.get("joint_reference_best"))),
+        ("Final selected model", _selection_summary_text(final_selection)),
+        ("Final selection policy", f"{final_selection.get('policy', 'auto')} / {final_selection.get('selection', 'unknown')}"),
+        ("Metric verdict", _metric_verdict_text(summary)),
         (
             "Evidence rows",
             f"attempts {counts.get('attempts', 0)}, relations {counts.get('relations', 0)}, components {counts.get('components', 0)}",
@@ -1969,6 +2237,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         graph_state=orchestrator.state,
         hcfg=hcfg,
         candidate_tournament_k=int(getattr(args, "candidate_tournament_k", 1)),
+        final_selection_policy=str(getattr(args, "final_selection_policy", "auto")),
     )
     dispatch_summary = _maybe_run_final_dispatch(args, run_root, target_metric)
     if dispatch_summary:
@@ -2212,6 +2481,7 @@ def cmd_continue(args: argparse.Namespace) -> dict[str, Any]:
         graph_state=orchestrator.state,
         hcfg=hcfg,
         candidate_tournament_k=int(getattr(args, "candidate_tournament_k", 1)),
+        final_selection_policy=str(getattr(args, "final_selection_policy", "auto")),
     )
     refreshed_sweep = _maybe_refresh_parent_sweep_summary(run_root, target_metric)
     dispatch_summary = _maybe_run_final_dispatch(args, run_root, target_metric)
@@ -2424,7 +2694,18 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     archive_candidate_limit = _archive_candidate_limit(args, dispatch_mode)
     if not history:
         raise RuntimeError(f"No completed iterations found in {run_root}")
-    protected_row = _best_history_row(history, target_metric)
+    paper_baseline = _load_paper_baseline(
+        hcfg,
+        method=str(args.paper_baseline_method),
+        override_mae=args.paper_baseline_mae,
+        override_mse=args.paper_baseline_mse,
+    )
+    protected_row, protected_selection_name, protected_selection_reason = _metric_aware_final_row(
+        history,
+        target_metric,
+        paper_baseline,
+        selection_policy=str(getattr(args, "final_selection_policy", "auto")),
+    )
     if protected_row is None:
         raise RuntimeError(f"No successful protected best model found in {run_root}")
 
@@ -2462,12 +2743,6 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         limit=int(args.evidence_limit),
     )
     target_diagnostics = args.target_diagnostics or _dominant_diagnostics(protected_feedback)
-    paper_baseline = _load_paper_baseline(
-        hcfg,
-        method=str(args.paper_baseline_method),
-        override_mae=args.paper_baseline_mae,
-        override_mse=args.paper_baseline_mse,
-    )
     motif_library = _mine_dispatch_motifs(
         run_root,
         hcfg,
@@ -2515,6 +2790,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_audit": evidence_audit,
         "protected_best": {
             "iteration": protected_iteration,
+            "selection": protected_selection_name,
+            "selection_reason": protected_selection_reason,
+            "final_selection_policy": str(getattr(args, "final_selection_policy", "auto")),
             "model_path": str(protected_model_path),
             "metrics": _paper_metric_summary(protected_result),
             "dominant_diagnostics": target_diagnostics,
@@ -2599,6 +2877,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "evidence_audit": evidence_audit,
             "protected_best": {
                 "iteration": protected_iteration,
+                "selection": protected_selection_name,
+                "selection_reason": protected_selection_reason,
+                "final_selection_policy": str(getattr(args, "final_selection_policy", "auto")),
                 "model_path": str(protected_model_path),
                 "metrics": _paper_metric_summary(protected_result),
                 "paper_gap": _paper_positive_gap(protected_result, paper_baseline),
@@ -2774,6 +3055,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_audit": evidence_audit,
         "protected_best": {
             "iteration": protected_iteration,
+            "selection": protected_selection_name,
+            "selection_reason": protected_selection_reason,
+            "final_selection_policy": str(getattr(args, "final_selection_policy", "auto")),
             "model_path": str(protected_model_path),
             "metrics": _paper_metric_summary(protected_result),
             "paper_gap": _paper_positive_gap(protected_result, paper_baseline),
@@ -2848,6 +3132,7 @@ def _maybe_run_final_dispatch(args: argparse.Namespace, run_root: Path, target_m
         paper_baseline_mae=getattr(args, "paper_baseline_mae", None),
         paper_baseline_mse=getattr(args, "paper_baseline_mse", None),
         min_relative_improvement=float(getattr(args, "min_relative_improvement", 0.0)),
+        final_selection_policy=str(getattr(args, "final_selection_policy", "auto")),
         epochs=getattr(args, "epochs", None),
         batch_size=getattr(args, "batch_size", None),
         lr=getattr(args, "lr", None),
@@ -2965,6 +3250,7 @@ def cmd_summarize_run(args: argparse.Namespace) -> dict[str, Any]:
         graph_state=orchestrator.state,
         hcfg=hcfg,
         candidate_tournament_k=int(getattr(args, "candidate_tournament_k", 1)),
+        final_selection_policy=str(getattr(args, "final_selection_policy", "auto")),
     )
     if previous_summary.get("final_dispatch"):
         summary["final_dispatch"] = previous_summary["final_dispatch"]
@@ -2977,6 +3263,15 @@ def cmd_summarize_run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _add_final_dispatch_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--final-selection-policy",
+        choices=["auto", "target", "joint", "balanced"],
+        default="auto",
+        help=(
+            "Final reporting/model selection policy. This does not change the iteration search. "
+            "auto keeps target best when MAE/MSE both improve, otherwise prefers a joint MAE+MSE non-regressive model if available."
+        ),
+    )
     parser.add_argument("--final-dispatch", action="store_true", help="run current-run-only evidence summary after iterations")
     parser.add_argument("--dispatch-name", default="evidence_dispatch_summary")
     parser.add_argument("--dispatch-llm-mode", choices=["auto", "off", "required"], default=None)
@@ -3074,6 +3369,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_p.add_argument("--paper-baseline-mae", type=float, default=None)
     dispatch_p.add_argument("--paper-baseline-mse", type=float, default=None)
     dispatch_p.add_argument("--min-relative-improvement", type=float, default=0.0)
+    dispatch_p.add_argument("--final-selection-policy", choices=["auto", "target", "joint", "balanced"], default="auto")
     dispatch_p.add_argument("--epochs", type=int, default=None)
     dispatch_p.add_argument("--batch-size", type=int, default=None)
     dispatch_p.add_argument("--lr", type=float, default=None)
@@ -3118,6 +3414,7 @@ def build_parser() -> argparse.ArgumentParser:
     summarize_run_p.add_argument("--target-metric", default=None)
     summarize_run_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default=None)
     summarize_run_p.add_argument("--candidate-tournament-k", type=int, default=1)
+    summarize_run_p.add_argument("--final-selection-policy", choices=["auto", "target", "joint", "balanced"], default="auto")
     summarize_run_p.set_defaults(func=cmd_summarize_run)
 
     summarize_p = sub.add_parser("summarize-sweep", help="refresh sweep summary from child run summaries")
