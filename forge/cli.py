@@ -527,6 +527,21 @@ def _write_run_summary(
         summary["best_metrics"] = _paper_metric_summary(best)
         summary["paper_gap"] = _paper_positive_gap(best, summary.get("paper_baseline"))
         summary["paper_delta"] = _paper_target_delta(best, summary.get("paper_baseline"))
+    successful_iterations = [
+        int(row["iteration"])
+        for row in history
+        if row.get("result", {}).get("success") and row.get("iteration") is not None
+    ]
+    all_iterations = [int(row["iteration"]) for row in history if row.get("iteration") is not None]
+    if all_iterations:
+        summary["best_selection"] = {
+            "policy": "global_min_target_metric",
+            "target_metric": target_metric,
+            "search_start_iteration": min(all_iterations),
+            "search_end_iteration": max(all_iterations),
+            "successful_candidate_count": len(successful_iterations),
+            "note": "Best model is selected once from the full iteration history, including resumed continuation rounds.",
+        }
     summary["evidence_audit"] = build_run_evidence_audit(
         graph_state or {},
         history,
@@ -556,14 +571,6 @@ def _print_forge_best_summary(summary: dict[str, Any], label: str = "FORGE best"
         f"[FORGE] {label}: {iter_text} "
         f"MAE={_format_metric(paper_mae)} MSE={_format_metric(paper_mse)}"
     )
-    paper_gap = summary.get("paper_gap") or {}
-    if paper_gap:
-        print(
-            "[FORGE] Remaining gap to paper target: "
-            f"MAE={_format_metric(paper_gap.get('mae'))} "
-            f"MSE={_format_metric(paper_gap.get('mse'))} "
-            f"total={_format_metric(paper_gap.get('total'))}"
-        )
     paper_delta = summary.get("paper_delta") or {}
     if paper_delta:
         print(_format_paper_delta_line("FORGE vs paper target", paper_delta))
@@ -691,9 +698,10 @@ def _format_paper_delta_line(label: str, delta: dict[str, Any]) -> str:
             f"(absolute better by MAE={_format_metric(abs(mae_delta))} MSE={_format_metric(abs(mse_delta))})"
         )
     return (
-        f"[FORGE] {label}: improvement_pct "
+        f"[FORGE] {label}: improvement over paper target "
         f"MAE={mae_pct:.2f}% MSE={mse_pct:.2f}% "
-        f"(signed_delta MAE={_format_metric(mae_delta)} MSE={_format_metric(mse_delta)}; negative delta is better)"
+        f"(signed_delta MAE={_format_metric(mae_delta)} MSE={_format_metric(mse_delta)}; "
+        "positive improvement means FORGE is better)"
     )
 
 
@@ -2405,23 +2413,13 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         print("[FORGE] No Ms-AeDNet paper target found; falling back to protected non-regression acceptance.")
-    protected_metrics = _paper_metric_summary(protected_result)
-    print(
-        f"[FORGE] FORGE protected best: iter_{protected_iteration:03d} "
-        f"MAE={_format_metric(protected_metrics.get('paper_mae'))} "
-        f"MSE={_format_metric(protected_metrics.get('paper_mse'))}"
-    )
-    protected_gap = _paper_positive_gap(protected_result, paper_baseline)
-    if protected_gap:
-        print(
-            "[FORGE] FORGE remaining gap to paper target: "
-            f"MAE={_format_metric(protected_gap.get('mae'))} "
-            f"MSE={_format_metric(protected_gap.get('mse'))} "
-            f"total={_format_metric(protected_gap.get('total'))}"
-        )
-    protected_delta = _paper_target_delta(protected_result, paper_baseline)
-    if protected_delta:
-        print(_format_paper_delta_line("FORGE protected best vs paper target", protected_delta))
+    if not bool(getattr(args, "suppress_metric_summary", False)):
+        protected_summary = {
+            "best_iteration": protected_iteration,
+            "best_metrics": _paper_metric_summary(protected_result),
+            "paper_delta": _paper_target_delta(protected_result, paper_baseline),
+        }
+        _print_forge_best_summary(protected_summary, label="FORGE protected best")
 
     if dispatch_mode == "summary":
         report_payload = _compact_dispatch_report_payload(payload)
@@ -2708,6 +2706,7 @@ def _maybe_run_final_dispatch(args: argparse.Namespace, run_root: Path, target_m
         seed=getattr(args, "seed", None),
         device=getattr(args, "device", None),
         cuda_id=getattr(args, "cuda_id", None),
+        suppress_metric_summary=True,
     )
     print(f"[FORGE] Final Evidence Dispatch: current-run-only {dispatch_mode} evidence")
     return cmd_dispatch(dispatch_args)

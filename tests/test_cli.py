@@ -6,11 +6,14 @@ import pytest
 from forge.cli import (
     _accept_dispatch_candidate,
     _dispatch_patch_quality,
+    _format_paper_delta_line,
     _maybe_refresh_parent_sweep_summary,
     _paper_positive_gap,
     _paper_target_delta,
     _parent_baseline_for_patch,
+    _print_forge_best_summary,
     _resolve_continue_target,
+    _write_run_summary,
     build_parser,
 )
 from forge.orchestrator import GraphOrchestrator
@@ -296,6 +299,81 @@ def test_paper_gap_zero_when_forge_beats_target_but_signed_delta_is_negative():
     assert delta["beats_both"] is True
     assert delta["mae_improvement_pct"] == pytest.approx(10.5189, rel=1e-4)
     assert delta["mse_improvement_pct"] == pytest.approx(6.7706, rel=1e-4)
+
+
+def test_paper_delta_line_always_reports_signed_improvement_pct():
+    line = _format_paper_delta_line(
+        "FORGE vs paper target",
+        {
+            "mae": 0.50,
+            "mse": -0.20,
+            "mae_improvement_pct": -10.0,
+            "mse_improvement_pct": 2.0,
+            "beats_both": False,
+        },
+    )
+
+    assert "improvement over paper target" in line
+    assert "MAE=-10.00%" in line
+    assert "MSE=2.00%" in line
+
+
+def test_print_forge_best_summary_omits_clipped_remaining_gap(capsys):
+    _print_forge_best_summary(
+        {
+            "best_iteration": 16,
+            "best_metrics": {"paper_mae": 4.2593, "paper_mse": 8.9407},
+            "paper_gap": {"mae": 0.0, "mse": 0.0, "total": 0.0},
+            "paper_delta": {
+                "mae": -0.5007,
+                "mse": -0.6493,
+                "mae_improvement_pct": 10.52,
+                "mse_improvement_pct": 6.77,
+                "beats_both": True,
+            },
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "FORGE best: iter_016 MAE=4.2593 MSE=8.9407" in output
+    assert "Remaining gap" not in output
+    assert "improvement over paper target" in output
+
+
+def test_write_run_summary_selects_single_best_from_full_history(tmp_path):
+    history = [
+        {
+            "iteration": 0,
+            "success": True,
+            "target": {"mae_inverse": 0.50},
+            "primary_component": "initial",
+            "run_dir": str(tmp_path / "iter_000"),
+            "result": {"success": True, "metrics": {"target": {"mae_inverse": 0.50}}},
+        },
+        {
+            "iteration": 10,
+            "success": True,
+            "target": {"mae_inverse": 0.20},
+            "primary_component": "encoder",
+            "run_dir": str(tmp_path / "iter_010"),
+            "result": {"success": True, "metrics": {"target": {"mae_inverse": 0.20}}},
+        },
+        {
+            "iteration": 30,
+            "success": True,
+            "target": {"mae_inverse": 0.30},
+            "primary_component": "head",
+            "run_dir": str(tmp_path / "iter_030"),
+            "result": {"success": True, "metrics": {"target": {"mae_inverse": 0.30}}},
+        },
+    ]
+
+    summary = _write_run_summary(tmp_path, 30, "mae_inverse", history)
+
+    assert summary["best_iteration"] == 10
+    assert summary["best_selection"]["search_start_iteration"] == 0
+    assert summary["best_selection"]["search_end_iteration"] == 30
+    assert summary["best_selection"]["successful_candidate_count"] == 3
 
 
 def test_dispatch_candidate_rejects_probe_gain_without_ms_aednet_gap_shrink():

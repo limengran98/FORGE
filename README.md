@@ -172,12 +172,12 @@ The refreshed summary prints both the paper target and the FORGE best result:
 
 ```text
 [FORGE] FORGE best: iter_016 MAE=4.2593 MSE=8.9407
-[FORGE] Remaining gap to paper target: MAE=0.0000 MSE=0.0000 total=0.0000
-[FORGE] FORGE vs paper target: improvement over paper target MAE=10.52% MSE=6.77%
+[FORGE] FORGE vs paper target: improvement over paper target MAE=10.52% MSE=6.77% (absolute better by MAE=0.5007 MSE=0.6493)
 ```
 
-`Remaining gap` is clipped at zero because lower MAE/MSE is better. The
-improvement percentage is `(paper_target - FORGE) / paper_target * 100`.
+The improvement percentage is `(paper_target - FORGE) / paper_target * 100`.
+Positive means FORGE is better than the paper target; negative means it is
+worse.
 
 ## Command Modes
 
@@ -240,8 +240,8 @@ Continue by 10 rounds if one of these is true:
 - `best_iteration` is equal to the current last iteration.
 - `best_iteration` is within the last 3-5 iterations.
 - `evidence_audit.metrics.improvement_rate` is still nonzero.
-- The latest summary says FORGE is improving but still has positive
-  `Remaining gap to paper target`.
+- The latest summary says FORGE still has negative improvement percentage
+  against the paper target on the metric you care about.
 
 Stop or switch to another seed/run if:
 
