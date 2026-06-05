@@ -10,7 +10,7 @@ to model components only through relations supported by observed error
 correction, and each accepted or rejected edit is preserved as an auditable
 model-improvement trace.
 
-![FORGE framework](docs/figures/forge_framework.svg)
+![FORGE framework](docs/figures/forge_framework.png)
 
 ## Core Idea
 

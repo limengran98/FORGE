@@ -31,6 +31,10 @@ runs/
 *.jpeg
 *.log
 
+# Tracked documentation figures
+!docs/figures/*.png
+!docs/figures/*.svg
+
 # OS/editor files
 .DS_Store
 .idea/
