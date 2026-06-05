@@ -17,6 +17,7 @@ configs/forge_llm.yaml
 *.pem
 
 # Baseline archives and extracted/produced data
+reference/
 *.zip
 data/
 runs/

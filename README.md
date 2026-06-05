@@ -42,14 +42,11 @@ configs/                 Experiment, harness, routing, and trust policies
 docs/figures/            README and paper-style figures
 forge/                   FORGE runtime, harness bridge, routing, CLI
 prompts/                 LLM prompts for model patching and evidence summary
-reference/               Local source archives and supporting PDFs
 runs/                    Experiment outputs
 skills/                  Reusable model templates and fallback patches
 tests/                   Unit tests
 workspace/               Saved initial model entry point
 ```
-
-The compressed reference code and PDF files are kept under `reference/`.
 
 ## Quick Start
 
