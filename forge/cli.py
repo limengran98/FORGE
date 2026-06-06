@@ -39,6 +39,7 @@ from .patching import (
     request_llm_dispatch_summary,
     request_llm_patch,
     request_llm_repair_patch,
+    request_llm_synthesis_patch,
     safety_fallback_candidate,
     save_failed_candidate_attempt,
 )
@@ -728,6 +729,7 @@ def _write_evidence_artifacts(run_root: Path, audit: dict[str, Any]) -> dict[str
         "relations": evidence_dir / "evidence_relations.csv",
         "components": evidence_dir / "evidence_components.csv",
         "strategy_timeline": evidence_dir / "evidence_strategy_timeline.csv",
+        "trace_regions": evidence_dir / "evidence_trace_regions.csv",
         "method_evidence": evidence_dir / "evidence_method_table.csv",
     }
     table_counts: dict[str, int] = {}
@@ -867,7 +869,8 @@ def _print_evidence_artifact_summary(summary: dict[str, Any]) -> None:
         f"{evidence_dir} "
         f"(attempts={counts.get('attempts', 0)}, "
         f"relations={counts.get('relations', 0)}, "
-        f"components={counts.get('components', 0)})"
+        f"components={counts.get('components', 0)}, "
+        f"trace_regions={counts.get('trace_regions', 0)})"
     )
 
 
@@ -898,6 +901,49 @@ def _top_trusted_components(summary: dict[str, Any], limit: int = 3) -> str:
     return ", ".join(items) if items else "none"
 
 
+def _short_text(value: Any, max_len: int = 48) -> str:
+    text = str(value or "unknown")
+    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
+def _trace_gain_text(row: dict[str, Any]) -> str:
+    mae = _safe_metric(row.get("total_paper_mae_delta"), 0.0)
+    mse = _safe_metric(row.get("total_paper_mse_delta"), 0.0)
+    if row.get("region_type") == "repair_path":
+        mae = _safe_metric(row.get("paper_mae_delta"), 0.0)
+        mse = _safe_metric(row.get("paper_mse_delta"), 0.0)
+    return f"ΔMAE={mae:+.4f}, ΔMSE={mse:+.4f}"
+
+
+def _trace_region_items(trace: dict[str, Any], key: str, limit: int = 2) -> str:
+    rows = trace.get(key) or []
+    if not rows:
+        return "none"
+    items = []
+    for row in rows[:limit]:
+        component = _short_text(row.get("component"), 24)
+        edit = _short_text(row.get("edit_action"), 34)
+        if key == "productive_core":
+            scope = row.get("metric_scope") or "unknown"
+            items.append(f"{component}/{edit}({scope}, {_trace_gain_text(row)})")
+        elif key == "trap_regions":
+            items.append(
+                f"{component}/{edit}(invalid={row.get('invalid_count', 0)}, "
+                f"repeat={row.get('repeated_useless_count', 0)}, {_trace_gain_text(row)})"
+            )
+        else:
+            status = row.get("status") or "unknown"
+            iteration = row.get("outcome_iteration")
+            iter_text = f"iter_{int(iteration):03d}" if iteration is not None else "iter_?"
+            items.append(f"{iter_text}:{component}/{edit}({status}, {_trace_gain_text(row)})")
+    return "; ".join(items)
+
+
+def _trace_risk_flags(trace: dict[str, Any]) -> str:
+    flags = ((trace.get("adaptive_task_card") or {}).get("risk_flags") or [])
+    return ", ".join(str(flag) for flag in flags[:4]) if flags else "none"
+
+
 def _selection_summary_text(selection: dict[str, Any] | None, metric_name: str | None = None) -> str:
     if not selection:
         return "none"
@@ -925,6 +971,27 @@ def _selection_with_improvement_text(selection: dict[str, Any] | None) -> str:
     mae_pct = _format_signed_percent(delta.get("mae_improvement_pct"))
     mse_pct = _format_signed_percent(delta.get("mse_improvement_pct"))
     return f"{iter_text}: MAE {mae} ({mae_pct}), MSE {mse} ({mse_pct})"
+
+
+def _dispatch_winner_text(summary: dict[str, Any]) -> str:
+    dispatch = summary.get("final_dispatch") or {}
+    if not dispatch:
+        return "not run"
+    mode = str(dispatch.get("dispatch_mode") or "unknown")
+    selected = str(dispatch.get("selected") or "unknown")
+    candidate_count = dispatch.get("candidate_count")
+    accepted_count = dispatch.get("accepted_count")
+    selected_index = dispatch.get("selected_candidate_index")
+    metrics = dispatch.get("final_metrics") or (dispatch.get("protected_best") or {}).get("metrics") or {}
+    metric_text = f"MAE {_format_metric(metrics.get('paper_mae'))}, MSE {_format_metric(metrics.get('paper_mse'))}"
+    if selected == "candidate":
+        index_text = f"candidate_{int(selected_index):02d}" if selected_index is not None else "candidate"
+        return f"{mode} {index_text} won ({metric_text}; accepted {accepted_count}/{candidate_count})"
+    if mode == "summary":
+        return f"summary-only; protected_best kept ({metric_text})"
+    if mode == "synthesis":
+        return f"synthesis candidates rejected; protected_best kept ({metric_text}; accepted {accepted_count}/{candidate_count})"
+    return f"{mode} selected {selected} ({metric_text}; accepted {accepted_count}/{candidate_count})"
 
 
 def _metric_verdict_text(summary: dict[str, Any]) -> str:
@@ -964,6 +1031,7 @@ def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
     delta = summary.get("paper_delta") or {}
     tradeoff = summary.get("metric_tradeoff") or {}
     final_selection = summary.get("final_selection") or {}
+    trace = (summary.get("evidence_audit") or {}).get("trace_consolidation") or {}
     best_iteration = summary.get("best_iteration")
     best_text = f"iter_{int(best_iteration):03d}" if best_iteration is not None else "unknown"
     rows = [
@@ -971,12 +1039,14 @@ def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
         ("MAE-best", _selection_with_improvement_text(tradeoff.get("best_by_mae"))),
         ("MSE-best", _selection_with_improvement_text(tradeoff.get("best_by_mse"))),
         ("Joint-best", _selection_with_improvement_text(tradeoff.get("joint_reference_best"))),
-        ("Final selected model", _selection_summary_text(final_selection)),
+        ("Protected best model", _selection_summary_text(final_selection)),
+        ("Dispatch winner", _dispatch_winner_text(summary)),
         ("Final selection policy", f"{final_selection.get('policy', 'auto')} / {final_selection.get('selection', 'unknown')}"),
         ("Metric verdict", _metric_verdict_text(summary)),
         (
             "Evidence rows",
-            f"attempts {counts.get('attempts', 0)}, relations {counts.get('relations', 0)}, components {counts.get('components', 0)}",
+            f"attempts {counts.get('attempts', 0)}, relations {counts.get('relations', 0)}, "
+            f"components {counts.get('components', 0)}, trace_regions {counts.get('trace_regions', 0)}",
         ),
         ("Improvement rate", _format_percent(evidence.get("improvement_rate"))),
         ("Invalid edit rate", _format_percent(evidence.get("invalid_edit_rate"))),
@@ -985,6 +1055,10 @@ def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
         ("Evidence alignment", _format_percent(evidence.get("evidence_alignment"))),
         ("Attempts to best", budget.get("attempts_to_best", "nan")),
         ("Top trusted components", _top_trusted_components(summary)),
+        ("Productive core", _trace_region_items(trace, "productive_core")),
+        ("Trap regions", _trace_region_items(trace, "trap_regions")),
+        ("Repair paths", _trace_region_items(trace, "repair_paths")),
+        ("Trace risk flags", _trace_risk_flags(trace)),
     ]
     _print_key_value_table("Concise evidence summary", rows)
 
@@ -1782,9 +1856,28 @@ def _dispatch_patch_quality(parent_source: str, candidate_source: str) -> dict[s
     }
 
 
+def _synthesis_patch_quality(parent_source: str, candidate_source: str) -> dict[str, Any]:
+    quality = _dispatch_patch_quality(parent_source, candidate_source)
+    if quality["passed"]:
+        quality["reason"] = "synthesis_" + str(quality["reason"])
+        return quality
+    if quality["reason"] != "motif_no_effect":
+        return quality
+    meaningful_total = int(quality.get("meaningful_added") or 0) + int(quality.get("meaningful_removed") or 0)
+    source_changed = _source_hash(parent_source) != _source_hash(candidate_source)
+    destructive_count = len(quality.get("destructively_removed_self_names") or [])
+    if source_changed and meaningful_total >= 2 and destructive_count <= 2:
+        quality = dict(quality)
+        quality["passed"] = True
+        quality["reason"] = "synthesis_small_delta_quality_passed"
+    return quality
+
+
 def _dispatch_mode(args: argparse.Namespace) -> str:
     mode = str(getattr(args, "dispatch_mode", None) or "summary").strip().lower()
-    if mode not in {"summary", "candidates"}:
+    if mode in {"synthesize", "trace_synthesis", "merge"}:
+        mode = "synthesis"
+    if mode not in {"summary", "synthesis", "candidates"}:
         raise ValueError(f"Unsupported dispatch mode: {mode}")
     return mode
 
@@ -1792,12 +1885,34 @@ def _dispatch_mode(args: argparse.Namespace) -> str:
 def _dispatch_candidate_limit(args: argparse.Namespace, dispatch_mode: str) -> int:
     value = getattr(args, "dispatch_candidates", None)
     if value is None:
-        return 0 if dispatch_mode == "summary" else 4
+        if dispatch_mode == "summary":
+            return 0
+        if dispatch_mode == "synthesis":
+            return 5
+        return 4
     return max(0, int(value))
 
 
+def _parse_bool_switch(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Expected a boolean switch value, got {value!r}")
+
+
+def _final_dispatch_enabled(args: argparse.Namespace) -> bool:
+    value = getattr(args, "final_summary", None)
+    if value is not None:
+        return _parse_bool_switch(value)
+    return bool(getattr(args, "final_dispatch", False))
+
+
 def _archive_candidate_limit(args: argparse.Namespace, dispatch_mode: str) -> int:
-    if dispatch_mode == "summary":
+    if dispatch_mode in {"summary", "synthesis"}:
         return 0
     return max(0, int(getattr(args, "archive_candidates", 0)))
 
@@ -1829,10 +1944,137 @@ def _compact_motif_for_report(motif: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_trace_region(row: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "region_type",
+        "signature_id",
+        "status",
+        "diagnostic",
+        "component",
+        "edit_action",
+        "attempt_count",
+        "support_count",
+        "improved_count",
+        "best_improvement_count",
+        "invalid_count",
+        "repeated_useless_count",
+        "repair_attempt_count",
+        "metric_scope",
+        "total_target_delta",
+        "total_paper_mae_delta",
+        "total_paper_mse_delta",
+        "target_delta",
+        "paper_mae_delta",
+        "paper_mse_delta",
+        "score",
+        "first_outcome_iteration",
+        "last_outcome_iteration",
+        "outcome_iteration",
+        "evidence_iterations",
+    ]
+    return {key: row.get(key) for key in keys if key in row}
+
+
+def _compact_trace_consolidation(trace: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+    if not trace:
+        return {}
+    return {
+        "schema": trace.get("schema"),
+        "metrics": trace.get("metrics") or {},
+        "productive_core": [
+            _compact_trace_region(row) for row in (trace.get("productive_core") or [])[:limit]
+        ],
+        "trap_regions": [
+            _compact_trace_region(row) for row in (trace.get("trap_regions") or [])[:limit]
+        ],
+        "repair_paths": [
+            _compact_trace_region(row) for row in (trace.get("repair_paths") or [])[:limit]
+        ],
+        "adaptive_task_card": trace.get("adaptive_task_card") or {},
+    }
+
+
+def _trace_synthesis_variants(trace: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    productive = trace.get("productive_core") or []
+    traps = trace.get("trap_regions") or []
+    repairs = trace.get("repair_paths") or []
+    adaptive = trace.get("adaptive_task_card") or {}
+    joint = [row for row in productive if row.get("metric_scope") == "joint"]
+    mae_only = [row for row in productive if row.get("metric_scope") == "mae_only"]
+    mse_only = [row for row in productive if row.get("metric_scope") == "mse_only"]
+    variants = [
+        {
+            "variant_id": "joint_core_merge",
+            "objective": "Merge the strongest joint MAE/MSE productive cores into the protected best with minimal additive edits.",
+            "positive_evidence": joint[:3] or productive[:3],
+            "secondary_evidence": (mae_only[:1] + mse_only[:1])[:2],
+            "avoid_evidence": traps[:5],
+            "repair_hints": repairs[:3],
+            "risk_posture": "conservative_additive",
+            "acceptance_hint": "Must improve at least one of MAE/MSE without regressing the other against protected best.",
+            "adaptive_task_card": adaptive,
+        },
+        {
+            "variant_id": "mse_guarded_core_merge",
+            "objective": "Use productive cores while explicitly guarding MSE and forecast-head stability.",
+            "positive_evidence": (joint[:2] + mse_only[:2] + productive[:1])[:4],
+            "secondary_evidence": mae_only[:2],
+            "avoid_evidence": traps[:6],
+            "repair_hints": repairs[:4],
+            "risk_posture": "mse_non_regression_guarded",
+            "acceptance_hint": "Do not trade lower MAE for worse MSE; preserve protected best behavior when uncertain.",
+            "adaptive_task_card": adaptive,
+        },
+        {
+            "variant_id": "low_risk_trap_aware_merge",
+            "objective": "Apply only the safest single productive core and suppress repeated trap edits.",
+            "positive_evidence": productive[:1],
+            "secondary_evidence": joint[:2],
+            "avoid_evidence": traps[:8],
+            "repair_hints": repairs[:5],
+            "risk_posture": "minimal_single_core",
+            "acceptance_hint": "Prefer a small executable improvement over a broad architecture rewrite.",
+            "adaptive_task_card": adaptive,
+        },
+        {
+            "variant_id": "dataset_specific_conservative_merge",
+            "objective": (
+                "Use only productive evidence from this run and avoid cross-dataset assumptions; "
+                "make a dataset-specific conservative merge around the current protected best."
+            ),
+            "positive_evidence": productive[:3],
+            "secondary_evidence": joint[:2],
+            "avoid_evidence": traps[:8],
+            "repair_hints": repairs[:4],
+            "risk_posture": "dataset_specific_low_transfer",
+            "acceptance_hint": "Respect the current dataset signature; reject broad edits that merely copy another cell's behavior.",
+            "adaptive_task_card": adaptive,
+        },
+        {
+            "variant_id": "repair_stabilized_core_merge",
+            "objective": (
+                "Synthesize a candidate from productive cores but explicitly reuse repair-path stability hints "
+                "to avoid shape/runtime failures and repeated useless edits."
+            ),
+            "positive_evidence": (joint[:2] + productive[:2])[:4],
+            "secondary_evidence": repairs[:5],
+            "avoid_evidence": traps[:8],
+            "repair_hints": repairs[:6],
+            "risk_posture": "repair_stabilized",
+            "acceptance_hint": "Preserve protected-best tensor contracts and use repair evidence only as implementation stabilization.",
+            "adaptive_task_card": adaptive,
+        },
+    ]
+    return variants[:limit]
+
+
 def _compact_dispatch_report_payload(payload: dict[str, Any], max_motifs: int = 10) -> dict[str, Any]:
     evidence = payload.get("trajectory_evidence") or {}
     motif_library = payload.get("motif_library") or {}
     motifs = motif_library.get("motifs") or []
+    audit = payload.get("evidence_audit") or {}
     return {
         "dispatch_objective": payload.get("dispatch_objective"),
         "dispatch_mode": "summary",
@@ -1840,9 +2082,10 @@ def _compact_dispatch_report_payload(payload: dict[str, Any], max_motifs: int = 
         "paper_baseline": payload.get("paper_baseline"),
         "evidence_scope": payload.get("evidence_scope"),
         "evidence_audit": {
-            "metrics": (payload.get("evidence_audit") or {}).get("metrics", {}),
-            "strategy_memory": (payload.get("evidence_audit") or {}).get("strategy_memory", {}),
+            "metrics": audit.get("metrics", {}),
+            "strategy_memory": audit.get("strategy_memory", {}),
         },
+        "trace_consolidation": _compact_trace_consolidation(audit.get("trace_consolidation") or {}),
         "trajectory_evidence": {
             "accepted_improvements": (evidence.get("accepted_improvements") or [])[:8],
             "rejected_or_failed_attempts": (evidence.get("rejected_or_failed_attempts") or [])[:8],
@@ -1857,12 +2100,52 @@ def _compact_dispatch_report_payload(payload: dict[str, Any], max_motifs: int = 
     }
 
 
+def _compact_synthesis_payload(
+    payload: dict[str, Any],
+    variant: dict[str, Any],
+    candidate_index: int,
+    candidate_count: int,
+    max_motifs: int = 6,
+) -> dict[str, Any]:
+    evidence = payload.get("trajectory_evidence") or {}
+    motif_library = payload.get("motif_library") or {}
+    motifs = motif_library.get("motifs") or []
+    audit = payload.get("evidence_audit") or {}
+    return {
+        "dispatch_objective": payload.get("dispatch_objective"),
+        "dispatch_mode": payload.get("dispatch_mode"),
+        "candidate_index": candidate_index,
+        "candidate_count": candidate_count,
+        "protected_best": payload.get("protected_best"),
+        "paper_baseline": payload.get("paper_baseline"),
+        "acceptance_policy": payload.get("acceptance_policy"),
+        "evidence_audit": {
+            "metrics": audit.get("metrics", {}),
+            "strategy_memory": audit.get("strategy_memory", {}),
+        },
+        "trace_consolidation": _compact_trace_consolidation(audit.get("trace_consolidation") or {}),
+        "synthesis_variant": variant,
+        "trajectory_evidence": {
+            "accepted_improvements": (evidence.get("accepted_improvements") or [])[:6],
+            "rejected_or_failed_attempts": (evidence.get("rejected_or_failed_attempts") or [])[:6],
+            "best_timeline_tail": (evidence.get("best_timeline_tail") or [])[-8:],
+        },
+        "motif_library": {
+            "sources": motif_library.get("sources", []),
+            "total_mined": motif_library.get("total_mined", 0),
+            "motifs": [_compact_motif_for_report(motif) for motif in motifs[:max_motifs]],
+        },
+    }
+
+
 def _deterministic_dispatch_report(payload: dict[str, Any]) -> dict[str, Any]:
     protected = payload.get("protected_best") or {}
     protected_iteration = int(protected.get("iteration") or 0)
     motif_library = payload.get("motif_library") or {}
     evidence = payload.get("trajectory_evidence") or {}
     motifs = motif_library.get("motifs") or []
+    trace = payload.get("trace_consolidation") or {}
+    trace_metrics = trace.get("metrics") or {}
     supported = [
         {
             "motif_id": motif.get("motif_id"),
@@ -1889,22 +2172,32 @@ def _deterministic_dispatch_report(payload: dict[str, Any]) -> dict[str, Any]:
         "schema": "forge.evidence_dispatch.report.v1",
         "llm_used": False,
         "summary": (
-            "Evidence Dispatch ran in summary-only mode. The final model remains the protected "
-            "Diagnostic Prober best; no new motif candidate was generated or evaluated."
+            "Evidence Dispatch ran in summary-only mode and consolidated the execution trace into "
+            "productive core, trap region, and repair path evidence. The final model remains the "
+            "protected Diagnostic Prober best; no new motif candidate was generated or evaluated."
         ),
         "protected_best_reason": (
             f"Protected iter_{protected_iteration:03d} is the best executable model "
             "selected by the fixed PEMFC harness."
         ),
+        "trace_landscape": {
+            "metrics": trace_metrics,
+            "productive_core": trace.get("productive_core") or [],
+            "trap_regions": trace.get("trap_regions") or [],
+            "repair_paths": trace.get("repair_paths") or [],
+            "adaptive_task_card": trace.get("adaptive_task_card") or {},
+        },
         "supported_motifs": supported,
         "negative_or_ambiguous_motifs": rejected,
         "audit_trace": [
             "diagnostic feedback -> routed component -> LLM/heuristic patch -> fixed-harness outcome",
+            "execution attempts -> outcome-calibrated trace landscape -> core/trap/repair rules",
             "only executable improvements enter the motif evidence library",
             "summary-only dispatch does not overwrite protected_best",
         ],
         "limitations": [
             "Motif evidence is observational and run-specific.",
+            "Trace regions are descriptive routing priors, not blind success predictors.",
             "No final counterfactual candidate is trained in summary-only mode.",
         ],
         "final_recommendation": "keep protected_best",
@@ -1918,6 +2211,7 @@ def _merge_llm_dispatch_report(fallback: dict[str, Any], llm_report: dict[str, A
         "protected_best_reason",
         "supported_motifs",
         "negative_or_ambiguous_motifs",
+        "trace_landscape",
         "audit_trace",
         "limitations",
         "final_recommendation",
@@ -2565,7 +2859,11 @@ def _evaluate_dispatch_candidate(
                     "destructively_removed_self_names": [],
                 }
             else:
-                quality = _dispatch_patch_quality(protected_source, candidate.source)
+                quality = (
+                    _synthesis_patch_quality(protected_source, candidate.source)
+                    if candidate.origin == "llm_trace_synthesis"
+                    else _dispatch_patch_quality(protected_source, candidate.source)
+                )
             patch_meta["motif_quality"] = quality
             if not quality["passed"]:
                 quality_error = str(quality["reason"])
@@ -2574,7 +2872,11 @@ def _evaluate_dispatch_candidate(
         except Exception as exc:
             validation_error = f"{type(exc).__name__}: {exc}"
             repair_attempts.append(save_failed_candidate_attempt(candidate, candidate_dir, attempt, validation_error))
-            can_repair = llm_cfg is not None and candidate.origin in {"llm_dispatch", "llm_motif_dispatch", "llm_repair"} and attempt < max_repair_rounds
+            can_repair = (
+                llm_cfg is not None
+                and candidate.origin in {"llm_dispatch", "llm_motif_dispatch", "llm_trace_synthesis", "llm_repair"}
+                and attempt < max_repair_rounds
+            )
             if can_repair:
                 try:
                     candidate = request_llm_repair_patch(
@@ -2774,20 +3076,32 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         target_metric,
         candidate_tournament_k=max(1, dispatch_candidate_limit or 1),
     )
-    payload = {
-        "dispatch_objective": (
+    trace_consolidation = evidence_audit.get("trace_consolidation") or {}
+    synthesis_variants = _trace_synthesis_variants(trace_consolidation, dispatch_candidate_limit) if dispatch_mode == "synthesis" else []
+    if dispatch_mode == "summary":
+        dispatch_objective = (
             "Summarize current-run PEMFC refinement evidence and keep the protected best "
             "model as the final artifact."
-            if dispatch_mode == "summary"
-            else (
-                "Counterfactually transplant one historically successful PEMFC patch motif "
-                "onto the protected best model. The candidate is accepted only if the fixed "
-                "harness shrinks the paper-scale MAE/MSE gap to the Ms-AeDNet target."
-            )
-        ),
+        )
+    elif dispatch_mode == "synthesis":
+        dispatch_objective = (
+            "Generate outcome-calibrated trace synthesis candidates from productive core, "
+            "trap region, and repair path evidence. Each candidate is accepted only if the "
+            "fixed harness improves on protected_best without MAE/MSE regression."
+        )
+    else:
+        dispatch_objective = (
+            "Counterfactually transplant one historically successful PEMFC patch motif "
+            "onto the protected best model. The candidate is accepted only if the fixed "
+            "harness shrinks the reference-target MAE/MSE gap."
+        )
+    payload = {
+        "dispatch_objective": dispatch_objective,
         "dispatch_mode": dispatch_mode,
         "method_framework": evidence_audit.get("method_framework"),
         "evidence_audit": evidence_audit,
+        "trace_consolidation": trace_consolidation,
+        "synthesis_variants": synthesis_variants,
         "protected_best": {
             "iteration": protected_iteration,
             "selection": protected_selection_name,
@@ -2806,6 +3120,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "acceptance_policy": {
             "protected_best_is_default_final": True,
             "summary_only_no_candidate_training": dispatch_mode == "summary",
+            "synthesis_candidate_training": dispatch_mode == "synthesis",
             "candidate_must_pass_same_harness": True,
             "candidate_must_not_regress_target_metric": target_metric,
             "candidate_must_not_regress_inverse_mse": True,
@@ -2830,6 +3145,8 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[FORGE] Evidence Dispatch mode: {dispatch_mode}")
     print(f"[FORGE] Evidence Dispatch motif sources: {len(motif_library['sources'])}")
     print(f"[FORGE] Evidence Dispatch motifs mined: {motif_library['total_mined']}")
+    if dispatch_mode == "synthesis":
+        print(f"[FORGE] Evidence Synthesis candidates planned: {len(synthesis_variants)}")
     if dispatch_mode == "candidates":
         print(f"[FORGE] Evidence Dispatch archive models mined: {archive_library['total_mined']}")
     if paper_baseline:
@@ -2875,6 +3192,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "evidence_scope": str(args.evidence_scope),
             "paper_baseline": paper_baseline,
             "evidence_audit": evidence_audit,
+            "trace_consolidation": evidence_audit.get("trace_consolidation") or {},
             "protected_best": {
                 "iteration": protected_iteration,
                 "selection": protected_selection_name,
@@ -2899,9 +3217,11 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             },
             "candidates": [],
             "accepted_count": 0,
+            "candidate_count": 0,
             "selected": "protected_best",
             "selected_candidate_index": None,
             "final_model_path": str(final_model_path),
+            "final_metrics": _paper_metric_summary(protected_result),
             "dispatch_report_path": str(dispatch_dir / "dispatch_report.json"),
             "dispatch_report": report,
             "non_regression_guarantee": (
@@ -2918,88 +3238,99 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
     candidate_records: list[dict[str, Any]] = []
     next_candidate_index = 0
-    for archive in archive_library["candidates"]:
-        archive_source = read_model_source(_resolve_stored_path(archive["model_path"], run_root))
-        archive_candidate = PatchCandidate(
-            source=archive_source,
-            rationale="Historical same-harness model achieved stronger executable metrics; verify as an archive promotion candidate.",
-            summary=f"Promote historical model {archive['archive_id']} as a fixed-harness candidate.",
-            component="archive_model",
-            origin="archive_model",
-            edit_action="promote_historical_best_model",
-            raw_response={"archive_model": archive},
-        )
-        archive_motif = {
-            "motif_id": archive["archive_id"],
-            "type": "archive_model_promotion",
-            "source_run_root": archive["source_run_root"],
-            "iteration": archive["iteration"],
-            "model_path": archive["model_path"],
-            "metrics": archive["metrics"],
-        }
-        candidate_records.append(
-            _evaluate_dispatch_candidate(
-                candidate_index=next_candidate_index,
-                candidate=archive_candidate,
-                candidate_dir=candidates_dir / f"candidate_{next_candidate_index:02d}_archive",
-                protected_copy=protected_copy,
-                protected_source=protected_source,
-                protected_iteration=protected_iteration,
-                protected_result=protected_result,
-                protected_feedback=protected_feedback,
-                protected_route=protected_row.get("route") or {},
-                history=history,
-                hcfg=hcfg,
-                target_metric=target_metric,
-                target_diagnostics=target_diagnostics,
-                paper_baseline=paper_baseline,
-                llm_cfg=llm_cfg,
-                max_repair_rounds=0,
-                motif=archive_motif,
-                min_relative_improvement=float(args.min_relative_improvement),
-            )
-        )
-        next_candidate_index += 1
-
     motifs = motif_library["motifs"][:dispatch_candidate_limit]
-    if llm_cfg is None or not motifs:
-        if llm_mode == "required" and not motifs and not candidate_records:
-            raise RuntimeError("Evidence Dispatch required LLM candidates, but no successful motifs were mined")
-    else:
-        for motif in motifs:
-            index = next_candidate_index
-            candidate_payload = {
-                **payload,
-                "selected_motif": motif,
-                "candidate_index": index,
-                "candidate_count": len(motifs),
-            }
-            try:
-                candidate = request_llm_dispatch_patch(llm_cfg, protected_source, candidate_payload)
-                candidate.origin = "llm_motif_dispatch"
-                if candidate.raw_response is None:
-                    candidate.raw_response = {}
-                candidate.raw_response["selected_motif_id"] = motif.get("motif_id")
-            except Exception as exc:
-                if llm_mode == "required":
-                    raise
-                candidate_records.append(
-                    {
-                        "candidate_index": index,
-                        "selected_motif": motif,
-                        "success": False,
-                        "error_type": "llm_dispatch",
-                        "error_message": f"{type(exc).__name__}: {exc}",
-                        "decision": {"accepted": False, "reason": "llm_dispatch_failed"},
-                    }
+    if dispatch_mode == "synthesis":
+        if llm_cfg is None:
+            if llm_mode == "required":
+                raise RuntimeError("Evidence Synthesis requires an LLM config, but none was available")
+        elif not synthesis_variants:
+            if llm_mode == "required":
+                raise RuntimeError("Evidence Synthesis required trace variants, but no trace evidence was available")
+        else:
+            for variant in synthesis_variants:
+                index = next_candidate_index
+                synthesis_payload = _compact_synthesis_payload(
+                    payload,
+                    variant,
+                    candidate_index=index,
+                    candidate_count=len(synthesis_variants),
                 )
-                continue
+                synthesis_motif = {
+                    "motif_id": f"trace_synthesis_{index:02d}_{variant.get('variant_id', 'variant')}",
+                    "type": "outcome_calibrated_trace_synthesis",
+                    "variant": variant,
+                    "protected_iteration": protected_iteration,
+                }
+                try:
+                    candidate = request_llm_synthesis_patch(llm_cfg, protected_source, synthesis_payload)
+                    if candidate.raw_response is None:
+                        candidate.raw_response = {}
+                    candidate.raw_response["synthesis_variant"] = variant
+                except Exception as exc:
+                    if llm_mode == "required":
+                        raise
+                    candidate_records.append(
+                        {
+                            "candidate_index": index,
+                            "selected_motif": synthesis_motif,
+                            "success": False,
+                            "error_type": "llm_synthesis",
+                            "error_message": f"{type(exc).__name__}: {exc}",
+                            "decision": {"accepted": False, "reason": "llm_synthesis_failed"},
+                        }
+                    )
+                    next_candidate_index += 1
+                    continue
 
+                candidate_records.append(
+                    _evaluate_dispatch_candidate(
+                        candidate_index=index,
+                        candidate=candidate,
+                        candidate_dir=candidates_dir / f"candidate_{index:02d}_synthesis",
+                        protected_copy=protected_copy,
+                        protected_source=protected_source,
+                        protected_iteration=protected_iteration,
+                        protected_result=protected_result,
+                        protected_feedback=protected_feedback,
+                        protected_route=protected_row.get("route") or {},
+                        history=history,
+                        hcfg=hcfg,
+                        target_metric=target_metric,
+                        target_diagnostics=target_diagnostics,
+                        paper_baseline=paper_baseline,
+                        llm_cfg=llm_cfg,
+                        max_repair_rounds=max_repair_rounds,
+                        motif=synthesis_motif,
+                        min_relative_improvement=float(args.min_relative_improvement),
+                    )
+                )
+                next_candidate_index += 1
+
+    if dispatch_mode == "candidates":
+        for archive in archive_library["candidates"]:
+            archive_source = read_model_source(_resolve_stored_path(archive["model_path"], run_root))
+            archive_candidate = PatchCandidate(
+                source=archive_source,
+                rationale="Historical same-harness model achieved stronger executable metrics; verify as an archive promotion candidate.",
+                summary=f"Promote historical model {archive['archive_id']} as a fixed-harness candidate.",
+                component="archive_model",
+                origin="archive_model",
+                edit_action="promote_historical_best_model",
+                raw_response={"archive_model": archive},
+            )
+            archive_motif = {
+                "motif_id": archive["archive_id"],
+                "type": "archive_model_promotion",
+                "source_run_root": archive["source_run_root"],
+                "iteration": archive["iteration"],
+                "model_path": archive["model_path"],
+                "metrics": archive["metrics"],
+            }
             candidate_records.append(
                 _evaluate_dispatch_candidate(
-                    candidate_index=index,
-                    candidate=candidate,
-                    candidate_dir=candidates_dir / f"candidate_{index:02d}",
+                    candidate_index=next_candidate_index,
+                    candidate=archive_candidate,
+                    candidate_dir=candidates_dir / f"candidate_{next_candidate_index:02d}_archive",
                     protected_copy=protected_copy,
                     protected_source=protected_source,
                     protected_iteration=protected_iteration,
@@ -3012,12 +3343,69 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     target_diagnostics=target_diagnostics,
                     paper_baseline=paper_baseline,
                     llm_cfg=llm_cfg,
-                    max_repair_rounds=max_repair_rounds,
-                    motif=motif,
+                    max_repair_rounds=0,
+                    motif=archive_motif,
                     min_relative_improvement=float(args.min_relative_improvement),
                 )
             )
             next_candidate_index += 1
+
+        if llm_cfg is None or not motifs:
+            if llm_mode == "required" and not motifs and not candidate_records:
+                raise RuntimeError("Evidence Dispatch required LLM candidates, but no successful motifs were mined")
+        else:
+            for motif in motifs:
+                index = next_candidate_index
+                candidate_payload = {
+                    **payload,
+                    "selected_motif": motif,
+                    "candidate_index": index,
+                    "candidate_count": len(motifs),
+                }
+                try:
+                    candidate = request_llm_dispatch_patch(llm_cfg, protected_source, candidate_payload)
+                    candidate.origin = "llm_motif_dispatch"
+                    if candidate.raw_response is None:
+                        candidate.raw_response = {}
+                    candidate.raw_response["selected_motif_id"] = motif.get("motif_id")
+                except Exception as exc:
+                    if llm_mode == "required":
+                        raise
+                    candidate_records.append(
+                        {
+                            "candidate_index": index,
+                            "selected_motif": motif,
+                            "success": False,
+                            "error_type": "llm_dispatch",
+                            "error_message": f"{type(exc).__name__}: {exc}",
+                            "decision": {"accepted": False, "reason": "llm_dispatch_failed"},
+                        }
+                    )
+                    continue
+
+                candidate_records.append(
+                    _evaluate_dispatch_candidate(
+                        candidate_index=index,
+                        candidate=candidate,
+                        candidate_dir=candidates_dir / f"candidate_{index:02d}",
+                        protected_copy=protected_copy,
+                        protected_source=protected_source,
+                        protected_iteration=protected_iteration,
+                        protected_result=protected_result,
+                        protected_feedback=protected_feedback,
+                        protected_route=protected_row.get("route") or {},
+                        history=history,
+                        hcfg=hcfg,
+                        target_metric=target_metric,
+                        target_diagnostics=target_diagnostics,
+                        paper_baseline=paper_baseline,
+                        llm_cfg=llm_cfg,
+                        max_repair_rounds=max_repair_rounds,
+                        motif=motif,
+                        min_relative_improvement=float(args.min_relative_improvement),
+                    )
+                )
+                next_candidate_index += 1
 
     accepted_records = [row for row in candidate_records if row.get("decision", {}).get("accepted")]
     selected_record = min(accepted_records, key=_candidate_selection_key) if accepted_records else None
@@ -3053,6 +3441,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_scope": str(args.evidence_scope),
         "paper_baseline": paper_baseline,
         "evidence_audit": evidence_audit,
+        "trace_consolidation": evidence_audit.get("trace_consolidation") or {},
         "protected_best": {
             "iteration": protected_iteration,
             "selection": protected_selection_name,
@@ -3077,17 +3466,27 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         },
         "candidates": compact_candidates,
         "accepted_count": len(accepted_records),
+        "candidate_count": len(candidate_records),
+        "synthesis_variants": synthesis_variants,
         "selected": selected,
         "selected_candidate_index": selected_record.get("candidate_index") if selected_record else None,
         "final_model_path": str(final_model_path),
+        "final_metrics": _paper_metric_summary(final_result),
         "non_regression_guarantee": (
-            "final_model is a motif candidate only if it passes the fixed harness and shrinks the "
-            "paper-scale MAE/MSE gap to the configured Ms-AeDNet target; otherwise protected_best is copied."
+            "final_model is a generated candidate only if it passes the fixed harness and improves on "
+            "protected_best without MAE/MSE regression; otherwise protected_best is copied."
         ),
     }
     save_json(summary, dispatch_dir / "dispatch_summary.json")
     print(f"[FORGE] Evidence Dispatch selected: {selected}")
-    print(f"[FORGE] Accepted motif candidates: {len(accepted_records)} / {len(candidate_records)}")
+    print(f"[FORGE] Accepted dispatch candidates: {len(accepted_records)} / {len(candidate_records)}")
+    if dispatch_mode == "synthesis":
+        winner = (
+            f"candidate_{int(selected_record.get('candidate_index')):02d}"
+            if selected_record and selected_record.get("candidate_index") is not None
+            else "protected_best"
+        )
+        print(f"[FORGE] Evidence Synthesis winner: {winner}")
     print(f"[FORGE] Dispatch summary: {dispatch_dir / 'dispatch_summary.json'}")
     print(f"[FORGE] Final model: {final_model_path}")
     return summary
@@ -3101,23 +3500,27 @@ def _compact_dispatch_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "evidence_scope": summary.get("evidence_scope"),
         "selected": summary.get("selected"),
         "accepted_count": summary.get("accepted_count"),
+        "candidate_count": summary.get("candidate_count"),
         "selected_candidate_index": summary.get("selected_candidate_index"),
         "final_model_path": summary.get("final_model_path"),
+        "final_metrics": summary.get("final_metrics"),
         "dispatch_report_path": summary.get("dispatch_report_path"),
         "protected_best": summary.get("protected_best"),
         "evidence_metrics": ((summary.get("evidence_audit") or {}).get("metrics") or {}),
+        "trace_consolidation": summary.get("trace_consolidation")
+        or ((summary.get("evidence_audit") or {}).get("trace_consolidation") or {}),
     }
 
 
 def _maybe_run_final_dispatch(args: argparse.Namespace, run_root: Path, target_metric: str) -> dict[str, Any] | None:
-    if not bool(getattr(args, "final_dispatch", False)):
+    if not _final_dispatch_enabled(args):
         return None
     dispatch_llm_mode = getattr(args, "dispatch_llm_mode", None) or getattr(args, "llm_mode", None) or "required"
     dispatch_mode = str(getattr(args, "dispatch_mode", None) or "summary")
     dispatch_args = argparse.Namespace(
         experiment_config=getattr(args, "experiment_config", str(CONFIG_DIR / "forge_experiment.yaml")),
         run_dir=str(run_root),
-        dispatch_name=getattr(args, "dispatch_name", None) or "evidence_dispatch_summary",
+        dispatch_name=getattr(args, "dispatch_name", None) or "evidence_dispatch_synthesis",
         llm_mode=dispatch_llm_mode,
         dispatch_mode=dispatch_mode,
         target_metric=target_metric,
@@ -3272,10 +3675,20 @@ def _add_final_dispatch_args(parser: argparse.ArgumentParser) -> None:
             "auto keeps target best when MAE/MSE both improve, otherwise prefers a joint MAE+MSE non-regressive model if available."
         ),
     )
-    parser.add_argument("--final-dispatch", action="store_true", help="run current-run-only evidence summary after iterations")
-    parser.add_argument("--dispatch-name", default="evidence_dispatch_summary")
+    parser.add_argument("--final-dispatch", action="store_true", help="legacy flag: run current-run-only evidence synthesis after iterations")
+    parser.add_argument(
+        "--final-summary",
+        nargs="?",
+        const="true",
+        default=None,
+        help=(
+            "explicit final-stage switch for run/continue/sweep. Use true to run the final "
+            "evidence synthesis/summary stage, false to skip it. Overrides --final-dispatch when set."
+        ),
+    )
+    parser.add_argument("--dispatch-name", default="evidence_dispatch_synthesis")
     parser.add_argument("--dispatch-llm-mode", choices=["auto", "off", "required"], default=None)
-    parser.add_argument("--dispatch-mode", choices=["summary", "candidates"], default="summary")
+    parser.add_argument("--dispatch-mode", choices=["summary", "synthesis", "candidates"], default="synthesis")
     parser.add_argument("--dispatch-candidates", type=int, default=None)
     parser.add_argument("--archive-candidates", type=int, default=0)
     parser.add_argument("--evidence-limit", type=int, default=16)
@@ -3350,9 +3763,9 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_p = sub.add_parser("dispatch", help="run protected Evidence Dispatch over a completed run")
     dispatch_p.add_argument("--experiment-config", default=str(CONFIG_DIR / "forge_experiment.yaml"))
     dispatch_p.add_argument("--run-dir", required=True)
-    dispatch_p.add_argument("--dispatch-name", default="evidence_dispatch_summary")
+    dispatch_p.add_argument("--dispatch-name", default="evidence_dispatch_synthesis")
     dispatch_p.add_argument("--llm-mode", choices=["auto", "off", "required"], default="required")
-    dispatch_p.add_argument("--dispatch-mode", choices=["summary", "candidates"], default="summary")
+    dispatch_p.add_argument("--dispatch-mode", choices=["summary", "synthesis", "candidates"], default="synthesis")
     dispatch_p.add_argument("--target-metric", default=None)
     dispatch_p.add_argument("--target-diagnostics", nargs="+", default=None)
     dispatch_p.add_argument("--evidence-limit", type=int, default=16)

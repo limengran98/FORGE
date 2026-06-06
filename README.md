@@ -26,10 +26,11 @@ FORGE separates model evolution into four stable modules:
 3. **Test-time strategy memory**: each run records the current failure
    hypothesis, trusted components, ineffective edits, forbidden repeats,
    expected improvement target, and protected best-so-far model.
-4. **Evidence dispatch summary**: after probing iterations, FORGE summarizes
-   successful and failed evidence from the same run and copies the protected
-   best model to the final artifact. It is intentionally summary-only in the
-   main workflow.
+4. **Evidence synthesis dispatch**: after probing iterations, FORGE consolidates
+   productive cores, trap regions, and repair paths from the same run, asks the
+   LLM to synthesize new guarded model candidates, and accepts a candidate only
+   if the fixed harness improves on the protected best without MAE/MSE
+   regression.
 
 The LLM is used as a constrained patch generator. It receives structured
 harness evidence and a routed edit scope, proposes local model code changes,
@@ -106,8 +107,9 @@ python -m forge.cli run \
   --routing-mode trust \
   --parent-policy best \
   --candidate-tournament-k 1 \
-  --final-dispatch \
-  --dispatch-mode summary \
+  --final-summary true \
+  --dispatch-mode synthesis \
+  --dispatch-candidates 5 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -128,8 +130,9 @@ python -m forge.cli run \
   --routing-mode trust \
   --parent-policy best \
   --candidate-tournament-k 1 \
-  --final-dispatch \
-  --dispatch-mode summary \
+  --final-summary true \
+  --dispatch-mode synthesis \
+  --dispatch-candidates 5 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -148,8 +151,9 @@ python -m forge.cli continue \
   --routing-mode trust \
   --parent-policy best \
   --candidate-tournament-k 1 \
-  --final-dispatch \
-  --dispatch-mode summary \
+  --final-summary true \
+  --dispatch-mode synthesis \
+  --dispatch-candidates 5 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -167,8 +171,9 @@ python -m forge.cli continue \
   --routing-mode trust \
   --parent-policy best \
   --candidate-tournament-k 1 \
-  --final-dispatch \
-  --dispatch-mode summary \
+  --final-summary true \
+  --dispatch-mode synthesis \
+  --dispatch-candidates 5 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -186,8 +191,9 @@ python -m forge.cli continue \
   --routing-mode trust \
   --parent-policy best \
   --candidate-tournament-k 1 \
-  --final-dispatch \
-  --dispatch-mode summary \
+  --final-summary true \
+  --dispatch-mode synthesis \
+  --dispatch-candidates 5 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -215,7 +221,8 @@ target and a concise evidence table:
 | MAE-best                   | iter_016: MAE 4.2593 (10.52%), ...   |
 | MSE-best                   | iter_016: MAE 4.2593, MSE 8.9407     |
 | Joint-best                 | iter_016: MAE 4.2593, MSE 8.9407     |
-| Final selected model       | iter_016 (MAE 4.2593, MSE 8.9407)    |
+| Protected best model       | iter_016 (MAE 4.2593, MSE 8.9407)    |
+| Dispatch winner            | synthesis candidate_00 won (...)     |
 | Final selection policy     | auto / target_best                   |
 | Improvement rate           | 22.50%                               |
 | Invalid edit rate          | 12.50%                               |
@@ -266,9 +273,11 @@ without changing the already completed search trajectory.
 | `--parent-policy` | `best`, `last` | `best` | Parent model selection. |
 | `--candidate-tournament-k` | currently must be `1` | `1` | Stable FORGE executes one candidate per round. |
 | `--final-selection-policy` | `auto`, `target`, `joint`, `balanced` | `auto` | Non-destructive final model selector. `auto` keeps target best when MAE/MSE both improve, otherwise selects a joint MAE+MSE non-regressive model if available. It does not change the iteration search. |
-| `--final-dispatch` | flag | enabled for official runs | Runs final evidence summary after iterations. |
-| `--dispatch-mode` | `summary`, `candidates` | `summary` | Summary-only is the main path; candidates is an ablation. |
-| `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence summary. |
+| `--final-summary` | `true`, `false` | `true` for official runs | Explicit switch for the final evidence stage. Works for both fresh `run` and resumed `continue`; `false` skips the final stage. |
+| `--final-dispatch` | flag | legacy alias | Older flag that enables the same final stage; `--final-summary true/false` is clearer and overrides it when set. |
+| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | `synthesis` generates guarded trace-merged model candidates; `summary` only writes a report; `candidates` is a motif-transplant ablation. |
+| `--dispatch-candidates` | integer `>=0` | `5` for synthesis, `4` for candidates, `0` for summary | Number of final-stage candidates. The main synthesis path now plans five trace-calibrated variants by default. |
+| `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence synthesis. |
 | `--archive-candidates` | integer `>=0` | `0` | Historical model promotion candidates; keep `0` for the main method. |
 | `--run-name` | string | descriptive name | Creates `runs/<run-name>`. |
 | `--run-dir` | path | existing path for `continue` | Existing run directory for continuation or refresh. |
@@ -294,17 +303,20 @@ Stop or switch to another seed/run if:
 
 ## Evidence Dispatch
 
-After Diagnostic Probers finish, Evidence Dispatch is summary-only by default.
-FORGE mines successful and failed patch motifs only from the preceding
-iterations of the same run, asks the LLM to summarize the executable evidence,
-and copies the protected prober best to `final/model.py`. It does not generate
-or evaluate a new model candidate in the main workflow.
+After Diagnostic Probers finish, Evidence Dispatch runs trace synthesis by
+default. FORGE groups execution attempts into productive cores, trap regions,
+and repair paths, asks the LLM to synthesize guarded model candidates from this
+outcome-calibrated evidence, evaluates each candidate under the same fixed
+harness, and accepts a candidate only when it improves on the protected best
+without MAE/MSE regression. If no synthesis candidate passes, the protected best
+remains final.
 
 ```bash
 python -m forge.cli dispatch \
   --run-dir runs/<run_name> \
   --llm-mode required \
-  --dispatch-mode summary \
+  --dispatch-mode synthesis \
+  --dispatch-candidates 5 \
   --evidence-scope current-run \
   --archive-candidates 0 \
   --target-diagnostics long_horizon_error residual_autocorrelation residual_drift \
@@ -315,6 +327,15 @@ python -m forge.cli dispatch \
 The dispatch artifact is saved under `runs/<run_name>/evidence_dispatch*/` with
 `protected_best/`, `final/`, `dispatch_payload.json`, `dispatch_report.json`,
 and `dispatch_summary.json`.
+
+Summary-only dispatch is available when you only want a report:
+
+```bash
+python -m forge.cli dispatch \
+  --run-dir runs/<run_name> \
+  --llm-mode required \
+  --dispatch-mode summary
+```
 
 Candidate-based final dispatch is kept as an explicit ablation:
 
@@ -399,6 +420,7 @@ Most protocol constants live outside Python:
 - `skills/forge_model_templates/`: complete fallback model templates
 - `prompts/model_patch.yaml`: LLM patch prompt
 - `prompts/evidence_summary.yaml`: summary-only evidence dispatch prompt
+- `prompts/evidence_synthesis.yaml`: outcome-calibrated trace synthesis prompt
 - `prompts/evidence_dispatch.yaml`: optional final-candidate ablation prompt
 
 ## Outputs
@@ -420,6 +442,7 @@ Runs are written under `runs/<run_name>/`:
 - `evidence/evidence_relations.csv`: feedback-component-edit relation table with trust and outcome statistics
 - `evidence/evidence_components.csv`: component-level success, failure, reuse, and metric-delta table
 - `evidence/evidence_strategy_timeline.csv`: test-time adaptation timeline across iterations
+- `evidence/evidence_trace_regions.csv`: outcome-calibrated productive core, trap region, and repair path table
 - `evidence/evidence_method_table.csv`: method-claim-to-artifact map for active memory, reuse, branch search, harness grounding, and auditability
 - `evidence_dispatch*/dispatch_summary.json`: protected best, mined motifs, summary report, and final model path
 

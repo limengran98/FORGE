@@ -95,6 +95,10 @@ def _load_dispatch_summary_prompt() -> dict[str, str]:
     return _load_prompt_file("evidence_summary.yaml")
 
 
+def _load_synthesis_prompt() -> dict[str, str]:
+    return _load_prompt_file("evidence_synthesis.yaml")
+
+
 def _load_prompt_file(name: str) -> dict[str, str]:
     prompt_path = PROMPTS_DIR / name
     prompt = load_yaml(prompt_path)
@@ -283,6 +287,43 @@ def request_llm_dispatch_summary(llm_config: dict[str, Any], payload: dict[str, 
     if not isinstance(response, dict):
         raise ValueError("LLM dispatch summary response must be a JSON object")
     return response
+
+
+def request_llm_synthesis_patch(
+    llm_config: dict[str, Any],
+    protected_source: str,
+    payload: dict[str, Any],
+) -> PatchCandidate:
+    prompt = _load_synthesis_prompt()
+    synthesis_payload = {
+        "harness_spec": load_pemfc_harness_spec(),
+        "protected_best_model_source": protected_source,
+        **payload,
+    }
+    user_text = prompt["user_template"].replace(
+        "${payload_json}",
+        json.dumps(synthesis_payload, indent=2, ensure_ascii=False),
+    )
+    response = chat_json(
+        [
+            {"role": "system", "content": prompt["system"]},
+            {"role": "user", "content": user_text},
+        ],
+        llm_config,
+    )
+    source = response.get("full_source") or response.get("source") or ""
+    class_name = get_model_class_name()
+    if not isinstance(source, str) or f"class {class_name}" not in source:
+        raise ValueError(f"LLM synthesis response must include full_source defining class {class_name}")
+    return PatchCandidate(
+        source=source.strip() + "\n",
+        rationale=str(response.get("rationale", "")),
+        summary=str(response.get("summary", "")),
+        component=str(response.get("component", "trace_synthesis")),
+        origin="llm_trace_synthesis",
+        edit_action=str(response.get("edit_action", "outcome_calibrated_trace_synthesis")),
+        raw_response=response,
+    )
 
 
 def safety_fallback_candidate(parent_source: str, route: dict[str, Any], reason: str) -> PatchCandidate:

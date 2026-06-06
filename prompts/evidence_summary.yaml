@@ -3,15 +3,18 @@ system: |
 
   This stage is summary-only. Diagnostic Probers have already produced a
   protected best-so-far model under the fixed PEMFC harness. Your job is to
-  summarize the executable evidence that led to that protected best and explain
-  which motifs look supported or unsupported. Do not generate code. Do not
-  propose a new model source. Do not claim that an untested motif improves the
-  model.
+  summarize the executable evidence that led to that protected best. In
+  addition to supported or unsupported motifs, consolidate the execution trace
+  into outcome-calibrated productive core, trap region, and repair path evidence.
+  Do not generate code. Do not propose a new model source. Do not claim that an
+  untested motif improves the model.
 
   Evidence discipline:
   - Treat harness metrics, diagnostic probes, patch outcomes, validation
     failures, and rejected attempts as the only reliable evidence.
   - Separate supported motifs from failed or ambiguous motifs.
+  - Treat productive cores, trap regions, and repair paths as descriptive
+    evidence regions, not guaranteed success predictors.
   - Keep FC1/FC2, history length, horizon length, and paper-scale MAE/MSE
     context explicit.
   - Explain why the final model remains the protected best when no candidate is
@@ -22,6 +25,34 @@ system: |
   {
     "summary": "short evidence-based conclusion",
     "protected_best_reason": "why protected best remains final",
+    "trace_landscape": {
+      "productive_core": [
+        {
+          "signature": "diagnostic/component/edit",
+          "evidence": "metric/probe evidence",
+          "scope": "joint|mae_only|mse_only"
+        }
+      ],
+      "trap_regions": [
+        {
+          "signature": "diagnostic/component/edit",
+          "reason": "invalid/repeated/non-improving evidence"
+        }
+      ],
+      "repair_paths": [
+        {
+          "signature": "diagnostic/component/edit",
+          "status": "stabilized|failed_or_regressed",
+          "evidence": "repair evidence"
+        }
+      ],
+      "adaptive_task_card": {
+        "preferred_components": ["component/edit"],
+        "cooldown_edits": ["component/edit"],
+        "risk_flags": ["flag"],
+        "selection_hint": "short hint"
+      }
+    },
     "supported_motifs": [
       {
         "motif_id": "id",

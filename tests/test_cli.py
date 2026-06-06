@@ -6,7 +6,9 @@ import pytest
 from forge.cli import (
     _accept_dispatch_candidate,
     _build_metric_tradeoff_summary,
+    _dispatch_candidate_limit,
     _dispatch_patch_quality,
+    _final_dispatch_enabled,
     _format_paper_delta_line,
     _maybe_refresh_parent_sweep_summary,
     _metric_aware_final_row,
@@ -16,6 +18,8 @@ from forge.cli import (
     _print_evidence_summary_table,
     _print_forge_best_summary,
     _resolve_continue_target,
+    _synthesis_patch_quality,
+    _trace_synthesis_variants,
     _write_run_summary,
     build_parser,
 )
@@ -124,14 +128,14 @@ def test_dispatch_parser_accepts_protected_evidence_dispatch():
     )
     assert args.run_dir == "runs/demo/FC1_L24_P12"
     assert args.llm_mode == "required"
-    assert args.dispatch_mode == "summary"
+    assert args.dispatch_mode == "synthesis"
     assert args.target_diagnostics == ["long_horizon_error", "residual_autocorrelation"]
     assert args.evidence_scope == "current-run"
     assert args.dispatch_candidates is None
     assert args.archive_candidates == 0
 
 
-def test_sweep_parser_defaults_final_dispatch_to_summary_only():
+def test_sweep_parser_defaults_final_dispatch_to_synthesis():
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -153,9 +157,78 @@ def test_sweep_parser_defaults_final_dispatch_to_summary_only():
         ]
     )
     assert args.final_dispatch is True
-    assert args.dispatch_mode == "summary"
+    assert _final_dispatch_enabled(args) is True
+    assert args.dispatch_mode == "synthesis"
     assert args.dispatch_candidates is None
     assert args.archive_candidates == 0
+
+
+def test_sweep_parser_accepts_final_summary_true_switch():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "sweep",
+            "--datasets",
+            "FC1",
+            "--seq-lens",
+            "24",
+            "--pred-lens",
+            "12",
+            "--rounds",
+            "20",
+            "--llm-mode",
+            "required",
+            "--final-summary",
+            "true",
+        ]
+    )
+    assert args.final_dispatch is False
+    assert args.final_summary == "true"
+    assert _final_dispatch_enabled(args) is True
+    assert _dispatch_candidate_limit(args, args.dispatch_mode) == 5
+
+
+def test_final_summary_false_overrides_legacy_flag():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "continue",
+            "--run-dir",
+            "runs/demo",
+            "--additional-rounds",
+            "10",
+            "--final-dispatch",
+            "--final-summary",
+            "false",
+        ]
+    )
+    assert args.final_dispatch is True
+    assert args.final_summary == "false"
+    assert _final_dispatch_enabled(args) is False
+
+
+def test_sweep_parser_accepts_summary_only_dispatch():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "sweep",
+            "--datasets",
+            "FC1",
+            "--seq-lens",
+            "24",
+            "--pred-lens",
+            "12",
+            "--rounds",
+            "20",
+            "--llm-mode",
+            "required",
+            "--final-dispatch",
+            "--dispatch-mode",
+            "summary",
+        ]
+    )
+    assert args.final_dispatch is True
+    assert args.dispatch_mode == "summary"
 
 
 def test_sweep_parser_accepts_candidate_dispatch_ablation():
@@ -187,6 +260,58 @@ def test_sweep_parser_accepts_candidate_dispatch_ablation():
     assert args.dispatch_mode == "candidates"
     assert args.dispatch_candidates == 4
     assert args.archive_candidates == 0
+
+
+def test_sweep_parser_accepts_synthesis_dispatch():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "sweep",
+            "--datasets",
+            "FC1",
+            "--seq-lens",
+            "24",
+            "--pred-lens",
+            "12",
+            "--rounds",
+            "20",
+            "--llm-mode",
+            "required",
+            "--final-dispatch",
+            "--dispatch-mode",
+            "synthesis",
+            "--dispatch-candidates",
+            "2",
+        ]
+    )
+    assert args.final_dispatch is True
+    assert args.dispatch_mode == "synthesis"
+    assert args.dispatch_candidates == 2
+
+
+def test_trace_synthesis_variants_support_k5():
+    trace = {
+        "productive_core": [
+            {"metric_scope": "joint", "component": "regularization", "edit_action": "add_gate"},
+            {"metric_scope": "joint", "component": "temporal_memory", "edit_action": "add_memory"},
+            {"metric_scope": "mae_only", "component": "prediction_head", "edit_action": "add_head"},
+            {"metric_scope": "mse_only", "component": "normalization", "edit_action": "add_norm"},
+        ],
+        "trap_regions": [{"component": "temporal_memory", "edit_action": "repeat_bad"}],
+        "repair_paths": [{"component": "prediction_head", "edit_action": "repair_shape"}],
+        "adaptive_task_card": {"risk_flags": ["high_repeated_useless_edit_rate"]},
+    }
+
+    variants = _trace_synthesis_variants(trace, 5)
+
+    assert len(variants) == 5
+    assert {row["variant_id"] for row in variants} == {
+        "joint_core_merge",
+        "mse_guarded_core_merge",
+        "low_risk_trap_aware_merge",
+        "dataset_specific_conservative_merge",
+        "repair_stabilized_core_merge",
+    }
 
 
 def test_dispatch_candidate_rejects_metric_regression():
@@ -350,6 +475,14 @@ def test_print_evidence_summary_table_is_readable(capsys):
             "best_metrics": {"paper_mae": 4.12, "paper_mse": 8.34},
             "paper_delta": {"mae_improvement_pct": 3.5, "mse_improvement_pct": -1.25},
             "evidence_artifacts": {"table_counts": {"attempts": 10, "relations": 42, "components": 3}},
+            "final_dispatch": {
+                "dispatch_mode": "synthesis",
+                "selected": "candidate",
+                "accepted_count": 1,
+                "candidate_count": 2,
+                "selected_candidate_index": 0,
+                "final_metrics": {"paper_mae": 4.10, "paper_mse": 8.12},
+            },
             "metric_tradeoff": {
                 "verdict": "mae_mse_both_improved",
                 "best_by_mae": {
@@ -378,6 +511,36 @@ def test_print_evidence_summary_table_is_readable(capsys):
                         {"component": "temporal_memory", "success_count": 2, "attempt_count": 5}
                     ]
                 },
+                "trace_consolidation": {
+                    "productive_core": [
+                        {
+                            "component": "temporal_memory",
+                            "edit_action": "add_gate",
+                            "metric_scope": "joint",
+                            "total_paper_mae_delta": 0.20,
+                            "total_paper_mse_delta": 0.40,
+                        }
+                    ],
+                    "trap_regions": [
+                        {
+                            "component": "regularization",
+                            "edit_action": "repeat_dropout",
+                            "invalid_count": 1,
+                            "repeated_useless_count": 2,
+                        }
+                    ],
+                    "repair_paths": [
+                        {
+                            "outcome_iteration": 4,
+                            "component": "prediction_head",
+                            "edit_action": "repair_shape",
+                            "status": "stabilized",
+                            "paper_mae_delta": 0.0,
+                            "paper_mse_delta": 0.0,
+                        }
+                    ],
+                    "adaptive_task_card": {"risk_flags": ["high_repeated_useless_edit_rate"]},
+                },
             },
         }
     )
@@ -391,9 +554,16 @@ def test_print_evidence_summary_table_is_readable(capsys):
     assert "MSE-best" in output
     assert "Joint-best" in output
     assert "MAE 4.1600 (2.00%), MSE 8.2000 (1.00%)" in output
+    assert "Protected best model" in output
+    assert "Dispatch winner" in output
+    assert "synthesis candidate_00 won" in output
     assert "Metric verdict" in output
     assert "MAE and MSE both improved" in output
     assert "temporal_memory(2/5)" in output
+    assert "Productive core" in output
+    assert "temporal_memory/add_gate(joint" in output
+    assert "Trap regions" in output
+    assert "Trace risk flags" in output
 
 
 def test_metric_tradeoff_detects_mae_gain_mse_regression():
@@ -552,6 +722,19 @@ def test_dispatch_patch_quality_rejects_noop_comment_patch():
 
     assert quality["passed"] is False
     assert quality["reason"] == "motif_no_effect"
+
+
+def test_synthesis_patch_quality_accepts_small_real_delta():
+    parent = "import torch\nclass ForgeModel:\n    def __init__(self):\n        self.head = 1.0\n"
+    candidate = "import torch\nclass ForgeModel:\n    def __init__(self):\n        self.head = 0.95\n"
+
+    motif_quality = _dispatch_patch_quality(parent, candidate)
+    synthesis_quality = _synthesis_patch_quality(parent, candidate)
+
+    assert motif_quality["passed"] is False
+    assert motif_quality["reason"] == "motif_no_effect"
+    assert synthesis_quality["passed"] is True
+    assert synthesis_quality["reason"] == "synthesis_small_delta_quality_passed"
 
 
 def test_dispatch_patch_quality_rejects_destructive_transplant():

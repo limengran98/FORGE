@@ -289,6 +289,235 @@ def _rate(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator) if denominator else 0.0
 
 
+def _signature(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("dominant_diagnostic") or "unknown"),
+        str(row.get("component") or "unknown"),
+        str(row.get("edit_action") or "unknown"),
+    )
+
+
+def _sum_float(rows: list[dict[str, Any]], key: str) -> float:
+    return sum(_safe_float(row.get(key), 0.0) for row in rows)
+
+
+def _trace_region_row(
+    region_type: str,
+    signature: tuple[str, str, str],
+    rows: list[dict[str, Any]],
+    score: float,
+    support_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    diagnostic, component, edit_action = signature
+    support = support_rows or rows
+    mae_gain = _sum_float(support, "paper_mae_delta")
+    mse_gain = _sum_float(support, "paper_mse_delta")
+    target_gain = _sum_float(support, "target_delta")
+    improved_count = sum(1 for row in rows if row.get("improved"))
+    invalid_count = sum(1 for row in rows if row.get("invalid_edit"))
+    repeated_count = sum(1 for row in rows if row.get("repeated_useless_edit"))
+    repair_count = sum(int(row.get("repair_attempt_count") or 0) for row in rows)
+    if mae_gain > 0 and mse_gain > 0:
+        metric_scope = "joint"
+    elif mae_gain > 0:
+        metric_scope = "mae_only"
+    elif mse_gain > 0:
+        metric_scope = "mse_only"
+    else:
+        metric_scope = "non_improving"
+    iterations = sorted({int(row.get("outcome_iteration", 0)) for row in support})
+    return {
+        "region_type": region_type,
+        "signature_id": " | ".join(signature),
+        "diagnostic": diagnostic,
+        "component": component,
+        "edit_action": edit_action,
+        "attempt_count": len(rows),
+        "support_count": len(support),
+        "improved_count": improved_count,
+        "best_improvement_count": sum(1 for row in rows if row.get("improved_vs_best_so_far")),
+        "invalid_count": invalid_count,
+        "repeated_useless_count": repeated_count,
+        "repair_attempt_count": repair_count,
+        "total_target_delta": target_gain,
+        "total_paper_mae_delta": mae_gain,
+        "total_paper_mse_delta": mse_gain,
+        "mean_target_delta": _safe_mean([_safe_float(row.get("target_delta"), math.nan) for row in support]),
+        "mean_paper_mae_delta": _safe_mean([_safe_float(row.get("paper_mae_delta"), math.nan) for row in support]),
+        "mean_paper_mse_delta": _safe_mean([_safe_float(row.get("paper_mse_delta"), math.nan) for row in support]),
+        "metric_scope": metric_scope,
+        "score": score,
+        "first_outcome_iteration": min(iterations) if iterations else None,
+        "last_outcome_iteration": max(iterations) if iterations else None,
+        "evidence_iterations": iterations[:12],
+    }
+
+
+def _build_trace_consolidation(attempts: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
+    """Compress execution attempts into core/trap/repair evidence regions."""
+
+    total = len(attempts)
+    if not total:
+        return {
+            "schema": "forge.trace_consolidation.v1",
+            "metrics": {},
+            "productive_core": [],
+            "trap_regions": [],
+            "repair_paths": [],
+            "adaptive_task_card": {},
+            "trace_region_table": [],
+        }
+
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in attempts:
+        groups[_signature(row)].append(row)
+
+    productive_rows: list[dict[str, Any]] = []
+    trap_rows: list[dict[str, Any]] = []
+    for signature, rows in groups.items():
+        support = [
+            row
+            for row in rows
+            if row.get("improved") and not row.get("invalid_edit")
+        ]
+        invalid_count = sum(1 for row in rows if row.get("invalid_edit"))
+        repeated_count = sum(1 for row in rows if row.get("repeated_useless_edit"))
+        non_improved_count = sum(1 for row in rows if not row.get("improved"))
+        negative_mae = sum(max(0.0, -_safe_float(row.get("paper_mae_delta"), 0.0)) for row in rows)
+        negative_mse = sum(max(0.0, -_safe_float(row.get("paper_mse_delta"), 0.0)) for row in rows)
+
+        if support:
+            mae_gain = _sum_float(support, "paper_mae_delta")
+            mse_gain = _sum_float(support, "paper_mse_delta")
+            best_gain_count = sum(1 for row in support if row.get("improved_vs_best_so_far"))
+            risk_penalty = 0.25 * invalid_count + 0.10 * repeated_count
+            joint_bonus = min(max(mae_gain, 0.0), max(mse_gain, 0.0))
+            score = mae_gain + 0.25 * mse_gain + 0.50 * joint_bonus + best_gain_count - risk_penalty
+            productive_rows.append(_trace_region_row("productive_core", signature, rows, score, support))
+
+        trap_signal = invalid_count + repeated_count + non_improved_count
+        if trap_signal:
+            score = (
+                2.0 * invalid_count
+                + repeated_count
+                + 0.25 * non_improved_count
+                + negative_mae
+                + 0.05 * negative_mse
+            )
+            trap_rows.append(_trace_region_row("trap_region", signature, rows, score, rows))
+
+    repair_paths = []
+    for row in attempts:
+        repair_attempt_count = int(row.get("repair_attempt_count") or 0)
+        if repair_attempt_count <= 0 and not row.get("validation_fallback"):
+            continue
+        target_delta = _safe_float(row.get("target_delta"), 0.0)
+        status = "stabilized" if row.get("success") and target_delta >= 0.0 else "failed_or_regressed"
+        repair_paths.append(
+            {
+                "region_type": "repair_path",
+                "status": status,
+                "outcome_iteration": row.get("outcome_iteration"),
+                "parent_iteration": row.get("parent_iteration"),
+                "diagnostic": row.get("dominant_diagnostic"),
+                "component": row.get("component"),
+                "edit_action": row.get("edit_action"),
+                "repair_attempt_count": repair_attempt_count,
+                "validation_fallback": bool(row.get("validation_fallback")),
+                "target_delta": target_delta,
+                "paper_mae_delta": _safe_float(row.get("paper_mae_delta"), 0.0),
+                "paper_mse_delta": _safe_float(row.get("paper_mse_delta"), 0.0),
+            }
+        )
+
+    productive_rows.sort(key=lambda row: row["score"], reverse=True)
+    trap_rows.sort(key=lambda row: row["score"], reverse=True)
+    repair_paths.sort(
+        key=lambda row: (
+            row["status"] != "stabilized",
+            -int(row.get("repair_attempt_count") or 0),
+            -int(row.get("outcome_iteration") or 0),
+        )
+    )
+
+    improved_count = sum(1 for row in attempts if row.get("improved"))
+    invalid_count = sum(1 for row in attempts if row.get("invalid_edit"))
+    repeated_count = sum(1 for row in attempts if row.get("repeated_useless_edit"))
+    repair_event_count = len(repair_paths)
+    joint_core_count = sum(1 for row in productive_rows if row.get("metric_scope") == "joint")
+
+    preferred_components = []
+    for row in productive_rows[:limit]:
+        item = {
+            "component": row["component"],
+            "edit_action": row["edit_action"],
+            "metric_scope": row["metric_scope"],
+            "score": row["score"],
+        }
+        if item not in preferred_components:
+            preferred_components.append(item)
+    cooldown_edits = [
+        {
+            "component": row["component"],
+            "edit_action": row["edit_action"],
+            "reason": (
+                f"invalid={row['invalid_count']}, repeated={row['repeated_useless_count']}, "
+                f"non-improving attempts={row['attempt_count'] - row['improved_count']}"
+            ),
+        }
+        for row in trap_rows[:limit]
+    ]
+    risk_flags = []
+    if _rate(invalid_count, total) >= 0.10:
+        risk_flags.append("high_invalid_edit_rate")
+    if _rate(repeated_count, total) >= 0.25:
+        risk_flags.append("high_repeated_useless_edit_rate")
+    if _rate(improved_count, total) <= 0.10:
+        risk_flags.append("low_core_access_rate")
+    if joint_core_count < max(1, len(productive_rows[:limit]) // 3):
+        risk_flags.append("mae_mse_tradeoff_requires_joint_selection")
+
+    adaptive_task_card = {
+        "preferred_components": preferred_components[:5],
+        "cooldown_edits": cooldown_edits[:5],
+        "risk_flags": risk_flags,
+        "selection_hint": (
+            "Use non-destructive final selection; prefer a joint MAE/MSE core when target-only "
+            "improvements trade off against MSE."
+        ),
+        "next_round_prior": (
+            "Prioritize productive_core signatures, suppress trap_region repeats, and use repair_path "
+            "evidence only for implementation repair rather than component credit."
+        ),
+    }
+
+    productive_top = productive_rows[:limit]
+    trap_top = trap_rows[:limit]
+    repair_top = repair_paths[:limit]
+    trace_region_table = productive_top + trap_top + repair_top
+    return {
+        "schema": "forge.trace_consolidation.v1",
+        "metrics": {
+            "attempt_count": total,
+            "productive_core_count": len(productive_rows),
+            "trap_region_count": len(trap_rows),
+            "repair_path_count": repair_event_count,
+            "core_access_rate": _rate(improved_count, total),
+            "trap_exposure_rate": _rate(
+                sum(1 for row in attempts if row.get("invalid_edit") or row.get("repeated_useless_edit") or not row.get("improved")),
+                total,
+            ),
+            "repair_event_rate": _rate(repair_event_count, total),
+            "joint_core_count": joint_core_count,
+        },
+        "productive_core": productive_top,
+        "trap_regions": trap_top,
+        "repair_paths": repair_top,
+        "adaptive_task_card": adaptive_task_card,
+        "trace_region_table": trace_region_table,
+    }
+
+
 def build_run_evidence_audit(
     graph_state: dict[str, Any],
     history: list[dict[str, Any]],
@@ -629,6 +858,7 @@ def build_run_evidence_audit(
         }
         for row in attempts
     ]
+    trace_consolidation = _build_trace_consolidation(attempts)
 
     method_evidence_table = [
         {
@@ -648,6 +878,12 @@ def build_run_evidence_audit(
             "saved_evidence": "negative memory, suppression count, repeated useless edit count, trusted components",
             "primary_metrics": "repeated_useless_edit_rate, invalid_edit_rate, trusted component success counts",
             "artifact": "evidence/evidence_attempts.csv; evidence/evidence_components.csv",
+        },
+        {
+            "claim": "outcome_calibrated_trace_consolidation",
+            "saved_evidence": "productive core, trap region, repair path, adaptive task card",
+            "primary_metrics": "core_access_rate, trap_exposure_rate, repair_event_rate, joint_core_count",
+            "artifact": "evidence/evidence_trace_regions.csv; summary.json/evidence_audit.trace_consolidation",
         },
         {
             "claim": "graph_branch_level_search",
@@ -675,11 +911,13 @@ def build_run_evidence_audit(
         "metrics": metrics,
         "routing_stability_by_diagnostic": stability_rows,
         "strategy_memory": strategy_memory,
+        "trace_consolidation": trace_consolidation,
         "tables": {
             "attempts": attempts,
             "relations": relation_table,
             "components": component_table,
             "strategy_timeline": strategy_timeline,
+            "trace_regions": trace_consolidation.get("trace_region_table", []),
             "method_evidence": method_evidence_table,
         },
         "attempts_tail": attempts[-12:],
