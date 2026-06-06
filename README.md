@@ -44,7 +44,7 @@ docs/figures/            README and paper-style figures
 forge/                   FORGE runtime, harness bridge, routing, CLI
 prompts/                 LLM prompts for model patching and evidence summary
 runs/                    Experiment outputs
-skills/                  Reusable model templates and fallback patches
+skills/                  Reusable model templates and validated repair patches
 tests/                   Unit tests
 workspace/               Saved initial model entry point
 ```
@@ -63,7 +63,7 @@ Run a short smoke test without calling the LLM:
 python -m forge.cli run --rounds 1 --epochs 5 --batch-size 64 --llm-mode off
 ```
 
-`--llm-mode off` is only for harness debugging. Official model-evolution runs
+`--llm-mode off` is reserved for harness smoke checks. Official model-evolution runs
 should use `--llm-mode required`.
 
 Select dataset, history length, and prediction horizon explicitly:
@@ -91,7 +91,7 @@ The recommended stable protocol is:
    and `evidence_audit`.
 3. Continue the same run by 10 rounds if the best model appears near the last
    iteration or the evidence audit still shows useful improvements.
-4. Use `--parent-policy best` so failed exploratory edits update memory without
+4. Use `--parent-policy best` so unsuccessful exploratory edits update memory without
    becoming the next parent model.
 
 Start a fresh FC1 run:
@@ -249,7 +249,7 @@ without changing the already completed search trajectory.
 - `sweep`: creates one child run per dataset/history/horizon combination.
 - `summarize-run`: refreshes one run summary without training or LLM calls.
 - `summarize-sweep`: refreshes a sweep-level summary from child summaries.
-- `dispatch`: runs only the final evidence summary over a completed run.
+- `dispatch`: runs the final evidence synthesis or report stage over a completed run.
 
 ## Parameter Reference
 
@@ -271,18 +271,18 @@ without changing the already completed search trajectory.
 | `--llm-mode` | `required`, `auto`, `off` | `required` official | LLM patch mode. |
 | `--routing-mode` | `trust`, `prior`, `rule`, `trust-action` | `trust` | Feedback routing policy. |
 | `--parent-policy` | `best`, `last` | `best` | Parent model selection. |
-| `--candidate-tournament-k` | currently must be `1` | `1` | Stable FORGE executes one candidate per round. |
+| `--candidate-tournament-k` | stable setting: `1` | `1` | Stable FORGE executes one evidence-routed candidate per round. |
 | `--final-selection-policy` | `auto`, `target`, `joint`, `balanced` | `auto` | Non-destructive final model selector. `auto` keeps target best when MAE/MSE both improve, otherwise selects a joint MAE+MSE non-regressive model if available. It does not change the iteration search. |
 | `--final-summary` | `true`, `false` | `true` for official runs | Explicit switch for the final evidence stage. Works for both fresh `run` and resumed `continue`; `false` skips the final stage. |
-| `--final-dispatch` | flag | legacy alias | Older flag that enables the same final stage; `--final-summary true/false` is clearer and overrides it when set. |
-| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | `synthesis` generates guarded trace-merged model candidates; `summary` only writes a report; `candidates` is a motif-transplant ablation. |
+| `--final-dispatch` | flag | compatible alias | Compatibility flag that enables the same final stage; `--final-summary true/false` is clearer and overrides it when set. |
+| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | `synthesis` generates guarded trace-merged model candidates; `summary` writes an audit report; `candidates` runs a motif-transplant comparison mode. |
 | `--dispatch-candidates` | integer `>=0` | `5` for synthesis, `4` for candidates, `0` for summary | Number of final-stage candidates. The main synthesis path now plans five trace-calibrated variants by default. |
 | `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence synthesis. |
 | `--archive-candidates` | integer `>=0` | `0` | Historical model promotion candidates; keep `0` for the main method. |
 | `--run-name` | string | descriptive name | Creates `runs/<run-name>`. |
 | `--run-dir` | path | existing path for `continue` | Existing run directory for continuation or refresh. |
 | `--scaling` | `baseline`, `train` | `baseline` | Scaling protocol. Keep the default for benchmark-compatible reporting. |
-| `--limit-rows` | integer or omitted | omit | Debug-only row limit. |
+| `--limit-rows` | integer or omitted | omit | Development-time row limit for fast harness checks. |
 
 ## When To Continue
 
@@ -291,7 +291,7 @@ Continue by 10 rounds if one of these is true:
 - `best_iteration` is equal to the current last iteration.
 - `best_iteration` is within the last 3-5 iterations.
 - `evidence_audit.metrics.improvement_rate` is still nonzero.
-- The latest summary still has negative improvement percentage against the
+- The latest summary still has below-target improvement percentage against the
   configured reference target on the metric you care about.
 
 Stop or switch to another seed/run if:
@@ -328,7 +328,7 @@ The dispatch artifact is saved under `runs/<run_name>/evidence_dispatch*/` with
 `protected_best/`, `final/`, `dispatch_payload.json`, `dispatch_report.json`,
 and `dispatch_summary.json`.
 
-Summary-only dispatch is available when you only want a report:
+Report dispatch is available for audit refreshes:
 
 ```bash
 python -m forge.cli dispatch \
@@ -337,7 +337,7 @@ python -m forge.cli dispatch \
   --dispatch-mode summary
 ```
 
-Candidate-based final dispatch is kept as an explicit ablation:
+Candidate-based motif dispatch is available as a comparison mode:
 
 ```bash
 python -m forge.cli dispatch \
@@ -355,12 +355,12 @@ FORGE supports four routing modes:
 - `trust`: main method. Diagnostic feedback propagates through learned
   feedback-component relations, and those relations are updated by executable
   outcomes.
-- `trust-action`: ablation for relation-level action memory, attention gates,
+- `trust-action`: comparison setting for relation-level action memory, attention gates,
   negative-memory suppression, and structural operator experiments.
 - `prior`: fixed PEMFC priors without outcome-based trust updates.
-- `rule`: legacy rule routing without diagnostic trust propagation.
+- `rule`: baseline rule routing without diagnostic trust propagation.
 
-Small two-dataset pilot:
+Focused two-dataset pilot:
 
 ```bash
 python -m forge.cli sweep \
@@ -375,7 +375,7 @@ python -m forge.cli sweep \
   --run-name pilot_trust_FC1_FC2_L24_P12_R10
 ```
 
-Ablation controls:
+Comparison controls:
 
 ```bash
 python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 --pred-lens 12 --rounds 10 --epochs 200 --llm-mode required --routing-mode rule --parent-policy best --run-name ablate_rule_FC1_FC2_L24_P12_R10
@@ -397,7 +397,7 @@ Run the full configured grid:
 python -m forge.cli sweep --rounds 1 --epochs 200 --llm-mode required
 ```
 
-Run a small subset:
+Run a focused subset:
 
 ```bash
 python -m forge.cli sweep --datasets FC1 FC2 --seq-lens 24 48 --pred-lens 6 12 --epochs 20 --llm-mode required
@@ -416,12 +416,12 @@ Most protocol constants live outside Python:
 - `configs/harness/routing_graph.yaml`: component graph
 - `configs/harness/routing_policy.yaml`: routing thresholds, weights, and reason text
 - `configs/harness/trust_policy.yaml`: diagnostic-component priors and executable outcome trust updates
-- `configs/harness/heuristic_patches.yaml`: component-to-template fallback mapping
-- `skills/forge_model_templates/`: complete fallback model templates
+- `configs/harness/heuristic_patches.yaml`: component-to-template repair mapping
+- `skills/forge_model_templates/`: complete repair model templates
 - `prompts/model_patch.yaml`: LLM patch prompt
-- `prompts/evidence_summary.yaml`: summary-only evidence dispatch prompt
+- `prompts/evidence_summary.yaml`: report-mode evidence dispatch prompt
 - `prompts/evidence_synthesis.yaml`: outcome-calibrated trace synthesis prompt
-- `prompts/evidence_dispatch.yaml`: optional final-candidate ablation prompt
+- `prompts/evidence_dispatch.yaml`: optional final-candidate comparison prompt
 
 ## Outputs
 
@@ -448,7 +448,7 @@ Runs are written under `runs/<run_name>/`:
 
 ## Graph Orchestration
 
-FORGE uses a deliberately small orchestration lifecycle:
+FORGE uses a focused orchestration lifecycle:
 
 ```text
 prepare -> evaluate -> feedback -> route -> patch -> report
@@ -456,8 +456,9 @@ prepare -> evaluate -> feedback -> route -> patch -> report
 
 The orchestrator records stage status, artifacts, harness result summaries,
 feedback snapshots, routing decisions, patch metadata, component evidence, and
-append-only events. Harness/model failures are treated as valid feedback;
-orchestration failure means the control flow or artifact handling itself broke.
+append-only events. Harness/model execution issues are recorded as valid
+feedback, while orchestration integrity checks cover control flow and artifact
+handling.
 
 The lifecycle is configured in `configs/harness/orchestration.yaml`, and the
 implementation is in `forge/orchestrator.py`.
