@@ -70,6 +70,22 @@ def test_run_dir_name_adds_round_suffix_when_missing(monkeypatch):
     assert name == "pilot_llm_FC1_FC2_L24_P12_R10_06081433"
 
 
+def test_run_dir_name_replaces_stale_round_after_manual_timestamp(monkeypatch):
+    monkeypatch.setattr("forge.cli._run_timestamp", lambda: "06081434")
+
+    name = _run_dir_name("pilot_short_merge_FC1_L24_P12_R10_06081234", 30, "forge")
+
+    assert name == "pilot_short_merge_FC1_L24_P12_R30_06081434"
+
+
+def test_run_dir_name_normalizes_malformed_round_suffix(monkeypatch):
+    monkeypatch.setattr("forge.cli._run_timestamp", lambda: "06081435")
+
+    name = _run_dir_name("pilot_short_merge_FC1_L24_P12_R1-0_06081234", 20, "forge")
+
+    assert name == "pilot_short_merge_FC1_L24_P12_R20_06081435"
+
+
 def test_continue_parser_accepts_resume_target():
     parser = build_parser()
     args = parser.parse_args(
@@ -203,7 +219,7 @@ def test_sweep_parser_accepts_final_summary_true_switch():
     assert args.final_dispatch is False
     assert args.final_summary == "true"
     assert _final_dispatch_enabled(args) is True
-    assert _dispatch_candidate_limit(args, args.dispatch_mode) == 5
+    assert _dispatch_candidate_limit(args, args.dispatch_mode) == 2
 
 
 def test_final_summary_false_overrides_legacy_flag():

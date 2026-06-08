@@ -19,18 +19,16 @@ FORGE separates model evolution into four stable modules:
 1. **PEMFC-native diagnostic harness**: fixed dataset loading, chronological
    split, training, validation, testing, metrics, logs, train/validation curves,
    residual probes, and invalid-patch detection.
-2. **Evidence reconstruction graph**: diagnostic feedback, model components,
+2. **Evidence-calibrated routing graph**: diagnostic feedback, model components,
    edit operators, and execution outcomes are represented as graph nodes.
    Feedback routing is calibrated by executable outcomes rather than semantic
    similarity or LLM confidence.
-3. **Test-time strategy memory**: each run records the current failure
-   hypothesis, trusted components, ineffective edits, forbidden repeats,
-   expected improvement target, and protected best-so-far model.
-4. **Evidence synthesis dispatch**: after probing iterations, FORGE consolidates
-   productive cores, trap regions, and repair paths from the same run, asks the
-   LLM to synthesize new guarded model candidates, and accepts a candidate only
-   if the fixed harness improves on the protected best without MAE/MSE
-   regression.
+3. **Accepted-parent selection with negative evidence suppression**: failed or
+   regressive patches still update evidence memory, but only accepted or
+   protected-best models can become the next parent.
+4. **Auditable trajectory**: each round records the diagnostic feedback, routed
+   relation, LLM patch or fallback, harness result, metric delta, trust update,
+   and accept/reject decision.
 
 The LLM is used as a constrained patch generator. It receives structured
 harness evidence and a routed edit scope, proposes local model code changes,
@@ -109,7 +107,7 @@ python -m forge.cli run \
   --candidate-tournament-k 1 \
   --final-summary true \
   --dispatch-mode synthesis \
-  --dispatch-candidates 5 \
+  --dispatch-candidates 2 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -132,7 +130,7 @@ python -m forge.cli run \
   --candidate-tournament-k 1 \
   --final-summary true \
   --dispatch-mode synthesis \
-  --dispatch-candidates 5 \
+  --dispatch-candidates 2 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -153,7 +151,7 @@ python -m forge.cli continue \
   --candidate-tournament-k 1 \
   --final-summary true \
   --dispatch-mode synthesis \
-  --dispatch-candidates 5 \
+  --dispatch-candidates 2 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -173,7 +171,7 @@ python -m forge.cli continue \
   --candidate-tournament-k 1 \
   --final-summary true \
   --dispatch-mode synthesis \
-  --dispatch-candidates 5 \
+  --dispatch-candidates 2 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -193,7 +191,7 @@ python -m forge.cli continue \
   --candidate-tournament-k 1 \
   --final-summary true \
   --dispatch-mode synthesis \
-  --dispatch-candidates 5 \
+  --dispatch-candidates 2 \
   --dispatch-llm-mode required \
   --archive-candidates 0 \
   --device cuda \
@@ -245,7 +243,10 @@ without changing the already completed search trajectory.
 - `run`: starts a new independent experiment. Use a fresh `--run-name` or an
   empty `--run-dir`.
 - `continue`: extends an existing run while preserving graph memory, model
-  versions, feedback vectors, routing records, and patch artifacts.
+  versions, feedback vectors, routing records, and patch artifacts. It uses the
+  supplied `--run-dir` directly; summaries compute the true maximum iteration
+  from saved `iter_*` folders even if an older directory name contains `R20`,
+  `R50`, or another stale label.
 - `sweep`: creates one child run per dataset/history/horizon combination.
 - `summarize-run`: refreshes one run summary without training or LLM calls.
 - `summarize-sweep`: refreshes a sweep-level summary from child summaries.
@@ -275,11 +276,11 @@ without changing the already completed search trajectory.
 | `--final-selection-policy` | `auto`, `target`, `joint`, `balanced` | `auto` | Non-destructive final model selector. `auto` keeps target best when MAE/MSE both improve, otherwise selects a joint MAE+MSE non-regressive model if available. It does not change the iteration search. |
 | `--final-summary` | `true`, `false` | `true` for official runs | Explicit switch for the final evidence stage. Works for both fresh `run` and resumed `continue`; `false` skips the final stage. |
 | `--final-dispatch` | flag | compatible alias | Compatibility flag that enables the same final stage; `--final-summary true/false` is clearer and overrides it when set. |
-| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | `synthesis` performs guarded outcome-calibrated fragment transplant from real successful trajectory evidence; `summary` writes an audit report; `candidates` runs a motif-transplant comparison mode. |
-| `--dispatch-candidates` | integer `>=0` | `5` for synthesis, `4` for candidates, `0` for summary | Total final-stage candidate budget. In synthesis mode, previous dispatch winners are re-verified first and the remaining budget is used for LLM boundary-adapted fragment transplants. |
+| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | Optional final evidence stage. `synthesis` tries guarded fragment transplant from successful trajectory evidence; `summary` writes an audit report; `candidates` runs a motif-transplant comparison mode. |
+| `--dispatch-candidates` | integer `>=0` | `2` for synthesis, `4` for candidates, `0` for summary | Total final-stage candidate budget. Keep synthesis small in the stable protocol; larger values are best treated as explicit ablations. |
 | `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence synthesis. |
 | `--archive-candidates` | integer `>=0` | `0` | Historical model promotion candidates; keep `0` for the main method. |
-| `--run-name` | string | descriptive name | Creates a normalized new run directory under `runs/`. FORGE rewrites any `_R<number>` suffix to the actual `--rounds` value and appends `_MMDDHHMM`, for example `pilot_FC1_R10` with `--rounds 20` becomes `pilot_FC1_R20_06081432`. |
+| `--run-name` | string | descriptive name | Creates a normalized new run directory under `runs/`. FORGE strips an existing trailing timestamp, rewrites stale or malformed round suffixes such as `_R10` or `_R1-0` to the actual `--rounds` value, and appends a fresh `_MMDDHHMM` timestamp. |
 | `--run-dir` | path | existing path for `continue` | Existing run directory for continuation or refresh. |
 | `--scaling` | `baseline`, `train` | `baseline` | Scaling protocol. Keep the default for benchmark-compatible reporting. |
 | `--limit-rows` | integer or omitted | omit | Development-time row limit for fast harness checks. |
@@ -303,22 +304,23 @@ Stop or switch to another seed/run if:
 
 ## Evidence Dispatch
 
-After Diagnostic Probers finish, Evidence Dispatch runs outcome-calibrated
-fragment synthesis by default. FORGE triages the trajectory into protected best,
-MAE-best, MSE-best, joint-best, recent effective improvement, and previous
-dispatch winners. It then ranks real successful diff fragments by dual-metric
-advantage, pollution risk, and component evidence. The LLM only adapts the
-selected fragment onto the protected best prefix; every candidate is evaluated
-under the same fixed harness and accepted only when it improves on the protected
-best without MAE/MSE regression. If no synthesis candidate passes, the protected
-best remains final.
+Evidence Dispatch is an optional final-stage audit or guarded synthesis step,
+not the main optimization engine. The main method is the probing trajectory
+driven by trust routing, accepted-parent selection, and negative evidence
+suppression. When synthesis is enabled, FORGE triages the completed trajectory
+into protected best, MAE-best, MSE-best, joint-best, and recent effective
+improvement records. The LLM may adapt a small number of successful fragments
+onto the protected best prefix; every candidate is evaluated under the same
+fixed harness and accepted only when it improves on the protected best without
+MAE/MSE regression. If no synthesis candidate passes, the protected best remains
+final.
 
 ```bash
 python -m forge.cli dispatch \
   --run-dir runs/<run_name> \
   --llm-mode required \
   --dispatch-mode synthesis \
-  --dispatch-candidates 5 \
+  --dispatch-candidates 2 \
   --evidence-scope current-run \
   --archive-candidates 0 \
   --target-diagnostics long_horizon_error residual_autocorrelation residual_drift \
@@ -352,13 +354,16 @@ python -m forge.cli dispatch \
 
 ## Trust Routing And Ablations
 
-FORGE supports four routing modes:
+The stable method uses `trust` routing:
 
 - `trust`: main method. Diagnostic feedback propagates through learned
   feedback-component relations, and those relations are updated by executable
   outcomes.
-- `trust-action`: comparison setting for relation-level action memory, attention gates,
-  negative-memory suppression, and structural operator experiments.
+
+The following modes are retained for controlled comparisons and future work:
+
+- `trust-action`: experimental setting for relation-level action memory,
+  attention gates, adaptive temperature, and structural operator experiments.
 - `prior`: fixed PEMFC priors without outcome-based trust updates.
 - `rule`: baseline rule routing without diagnostic trust propagation.
 

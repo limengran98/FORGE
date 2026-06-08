@@ -33,8 +33,8 @@ def method_framework(candidate_tournament_k: int = 1) -> dict[str, Any]:
                 ),
             },
             {
-                "id": "evidence_reconstruction_graph",
-                "name": "Evidence reconstruction graph",
+                "id": "evidence_calibrated_routing_graph",
+                "name": "Evidence-calibrated routing graph",
                 "role": "execution-calibrated feedback routing",
                 "nodes": ["feedback", "component", "edit", "outcome"],
                 "edge_evidence": (
@@ -47,46 +47,50 @@ def method_framework(candidate_tournament_k: int = 1) -> dict[str, Any]:
                 ),
             },
             {
-                "id": "test_time_adaptive_strategy_memory",
-                "name": "Test-time adaptive strategy memory",
-                "role": "short-horizon policy state refreshed after each harness outcome",
-                "state_fields": [
-                    "current_failure_hypotheses",
-                    "proven_ineffective_edits",
-                    "trusted_components",
-                    "next_candidate_scope",
-                    "forbidden_repeats",
-                    "expected_improvement_metric",
+                "id": "accepted_parent_negative_suppression",
+                "name": "Accepted-parent selection and negative evidence suppression",
+                "role": "stable model inheritance and failure reuse",
+                "selection_rules": [
+                    "successful candidates may update evidence memory",
+                    "only accepted or protected best models can become the next parent",
+                    "failed, mismatched, or regressive edits are retained as negative evidence",
+                    "repeated ineffective feedback-component routes are suppressed",
                 ],
-                "refresh_triggers": [
-                    "stagnation",
-                    "route_entropy_high",
-                    "same_component_without_gain",
-                    "runtime_or_shape_failure",
-                    "cross_cell_tradeoff",
-                    "diagnostic_signature_change",
-                ],
+                "principle": (
+                    "Bad patches are useful evidence, but they must not contaminate the inherited "
+                    "model trajectory."
+                ),
             },
             {
-                "id": "k_candidate_evidence_tournament",
-                "name": "K-candidate evidence tournament",
-                "role": "bounded candidate competition under the fixed harness",
-                "configured_k": int(max(1, candidate_tournament_k)),
-                "candidate_contract": [
-                    "evidence",
-                    "target_component",
-                    "edit_type",
-                    "expected_effect",
-                    "risk",
-                    "interface_constraints",
-                    "stop_or_reject_condition",
+                "id": "auditable_trajectory",
+                "name": "Auditable trajectory",
+                "role": "complete evidence chain for every refinement attempt",
+                "trace_fields": [
+                    "diagnostic_feedback",
+                    "routed_relation",
+                    "trust_before",
+                    "llm_patch_or_fallback",
+                    "harness_outcome",
+                    "metric_delta",
+                    "trust_update",
+                    "accept_or_reject_decision",
                 ],
-                "default_behavior": (
-                    "K=1 preserves the validated trust-routing main line; K>1 should be treated "
-                    "as an explicit budgeted tournament experiment."
+                "principle": (
+                    "FORGE reports the model it found and the executable evidence explaining how "
+                    "each routing decision was supported, corrected, or suppressed."
                 ),
             },
         ],
+        "experimental_extensions": {
+            "candidate_tournament_k": int(max(1, candidate_tournament_k)),
+            "not_mainline": [
+                "adaptive_relation_temperature",
+                "relation_level_action_memory",
+                "llm_motif_dispatch",
+                "k_candidate_tournament",
+            ],
+            "note": "These remain available for ablation or future work, but the stable method reports the four modules above.",
+        },
     }
 
 

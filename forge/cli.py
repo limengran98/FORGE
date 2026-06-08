@@ -58,12 +58,22 @@ def _run_timestamp() -> str:
     return datetime.utcnow().strftime("%m%d%H%M")
 
 
+def _strip_run_timestamp_suffix(name: str) -> str:
+    cleaned = str(name)
+    previous = None
+    while cleaned != previous:
+        previous = cleaned
+        cleaned = re.sub(r"_\d{8}$", "", cleaned)
+        cleaned = re.sub(r"_\d{8}_\d{6}$", "", cleaned)
+    return cleaned
+
+
 def _run_dir_name(base_name: str | None, rounds: int, default_prefix: str) -> str:
     name = str(base_name or default_prefix).strip() or default_prefix
-    name = re.sub(r"_\d{8}$", "", name)
-    name = re.sub(r"_\d{8}_\d{6}$", "", name)
-    if re.search(r"(?<=_)R\d+(?=_|$)", name):
-        name = re.sub(r"(?<=_)R\d+(?=_|$)", f"R{int(rounds)}", name)
+    name = _strip_run_timestamp_suffix(name)
+    round_pattern = r"(?<=_)R\d+(?:-\d+)*(?=_|$)"
+    if re.search(round_pattern, name):
+        name = re.sub(round_pattern, f"R{int(rounds)}", name)
     else:
         name = f"{name}_R{int(rounds)}"
     return f"{name}_{_run_timestamp()}"
@@ -2403,7 +2413,7 @@ def _dispatch_candidate_limit(args: argparse.Namespace, dispatch_mode: str) -> i
         if dispatch_mode == "summary":
             return 0
         if dispatch_mode == "synthesis":
-            return 5
+            return 2
         return 4
     return max(0, int(value))
 

@@ -7,11 +7,11 @@ def test_method_framework_has_four_modules():
     assert framework["schema"] == "forge.method_framework.v1"
     assert [module["id"] for module in framework["modules"]] == [
         "pemfc_native_diagnostic_harness",
-        "evidence_reconstruction_graph",
-        "test_time_adaptive_strategy_memory",
-        "k_candidate_evidence_tournament",
+        "evidence_calibrated_routing_graph",
+        "accepted_parent_negative_suppression",
+        "auditable_trajectory",
     ]
-    assert framework["modules"][-1]["configured_k"] == 3
+    assert framework["experimental_extensions"]["candidate_tournament_k"] == 3
 
 
 def test_evidence_audit_computes_routing_metrics():
