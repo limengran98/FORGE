@@ -144,7 +144,7 @@ Continue an existing FC1 run by 10 rounds:
 
 ```bash
 python -m forge.cli continue \
-  --run-dir runs/pilot_trust_summary_FC1_L24_P12_R20 \
+  --run-dir runs/<printed_FC1_run_dir> \
   --additional-rounds 10 \
   --epochs 200 \
   --llm-mode required \
@@ -164,7 +164,7 @@ Continue an existing FC2 run by 10 rounds:
 
 ```bash
 python -m forge.cli continue \
-  --run-dir runs/pilot_trust_summary_FC2_L24_P12_R20 \
+  --run-dir runs/<printed_FC2_run_dir> \
   --additional-rounds 10 \
   --epochs 200 \
   --llm-mode required \
@@ -184,7 +184,7 @@ Continue to an absolute final iteration index:
 
 ```bash
 python -m forge.cli continue \
-  --run-dir runs/pilot_trust_summary_FC1_L24_P12_R20 \
+  --run-dir runs/<printed_FC1_run_dir> \
   --to-round 50 \
   --epochs 200 \
   --llm-mode required \
@@ -203,7 +203,7 @@ python -m forge.cli continue \
 Refresh one completed run without training:
 
 ```bash
-python -m forge.cli summarize-run --run-dir runs/pilot_trust_summary_FC1_L24_P12_R20
+python -m forge.cli summarize-run --run-dir runs/<printed_FC1_run_dir>
 ```
 
 The summary prints the global best model from `iter_000` to the current maximum
