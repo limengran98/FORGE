@@ -275,11 +275,11 @@ without changing the already completed search trajectory.
 | `--final-selection-policy` | `auto`, `target`, `joint`, `balanced` | `auto` | Non-destructive final model selector. `auto` keeps target best when MAE/MSE both improve, otherwise selects a joint MAE+MSE non-regressive model if available. It does not change the iteration search. |
 | `--final-summary` | `true`, `false` | `true` for official runs | Explicit switch for the final evidence stage. Works for both fresh `run` and resumed `continue`; `false` skips the final stage. |
 | `--final-dispatch` | flag | compatible alias | Compatibility flag that enables the same final stage; `--final-summary true/false` is clearer and overrides it when set. |
-| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | `synthesis` generates guarded trace-merged model candidates; `summary` writes an audit report; `candidates` runs a motif-transplant comparison mode. |
-| `--dispatch-candidates` | integer `>=0` | `5` for synthesis, `4` for candidates, `0` for summary | Number of final-stage candidates. The main synthesis path now plans five trace-calibrated variants by default. |
+| `--dispatch-mode` | `synthesis`, `summary`, `candidates` | `synthesis` | `synthesis` performs guarded outcome-calibrated fragment transplant from real successful trajectory evidence; `summary` writes an audit report; `candidates` runs a motif-transplant comparison mode. |
+| `--dispatch-candidates` | integer `>=0` | `5` for synthesis, `4` for candidates, `0` for summary | Total final-stage candidate budget. In synthesis mode, previous dispatch winners are re-verified first and the remaining budget is used for LLM boundary-adapted fragment transplants. |
 | `--dispatch-llm-mode` | `required`, `auto`, `off` | `required` | LLM mode for final evidence synthesis. |
 | `--archive-candidates` | integer `>=0` | `0` | Historical model promotion candidates; keep `0` for the main method. |
-| `--run-name` | string | descriptive name | Creates `runs/<run-name>`. |
+| `--run-name` | string | descriptive name | Creates a normalized new run directory under `runs/`. FORGE rewrites any `_R<number>` suffix to the actual `--rounds` value and appends `_MMDDHHMM`, for example `pilot_FC1_R10` with `--rounds 20` becomes `pilot_FC1_R20_06081432`. |
 | `--run-dir` | path | existing path for `continue` | Existing run directory for continuation or refresh. |
 | `--scaling` | `baseline`, `train` | `baseline` | Scaling protocol. Keep the default for benchmark-compatible reporting. |
 | `--limit-rows` | integer or omitted | omit | Development-time row limit for fast harness checks. |
@@ -303,13 +303,15 @@ Stop or switch to another seed/run if:
 
 ## Evidence Dispatch
 
-After Diagnostic Probers finish, Evidence Dispatch runs trace synthesis by
-default. FORGE groups execution attempts into productive cores, trap regions,
-and repair paths, asks the LLM to synthesize guarded model candidates from this
-outcome-calibrated evidence, evaluates each candidate under the same fixed
-harness, and accepts a candidate only when it improves on the protected best
-without MAE/MSE regression. If no synthesis candidate passes, the protected best
-remains final.
+After Diagnostic Probers finish, Evidence Dispatch runs outcome-calibrated
+fragment synthesis by default. FORGE triages the trajectory into protected best,
+MAE-best, MSE-best, joint-best, recent effective improvement, and previous
+dispatch winners. It then ranks real successful diff fragments by dual-metric
+advantage, pollution risk, and component evidence. The LLM only adapts the
+selected fragment onto the protected best prefix; every candidate is evaluated
+under the same fixed harness and accepted only when it improves on the protected
+best without MAE/MSE regression. If no synthesis candidate passes, the protected
+best remains final.
 
 ```bash
 python -m forge.cli dispatch \

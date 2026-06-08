@@ -5,6 +5,7 @@ import pytest
 
 from forge.cli import (
     _accept_dispatch_candidate,
+    _build_fragment_cards,
     _build_metric_tradeoff_summary,
     _dispatch_candidate_limit,
     _dispatch_patch_quality,
@@ -18,6 +19,7 @@ from forge.cli import (
     _print_evidence_summary_table,
     _print_forge_best_summary,
     _resolve_continue_target,
+    _run_dir_name,
     _synthesis_patch_quality,
     _trace_synthesis_variants,
     _write_run_summary,
@@ -50,6 +52,22 @@ def test_sweep_parser_accepts_subset_grid():
     assert args.seq_lens == [24, 48]
     assert args.pred_lens == [6, 12]
     assert args.epochs == 1
+
+
+def test_run_dir_name_replaces_stale_round_suffix(monkeypatch):
+    monkeypatch.setattr("forge.cli._run_timestamp", lambda: "06081432")
+
+    name = _run_dir_name("pilot_short_merge_FC1_L24_P12_R10", 20, "forge")
+
+    assert name == "pilot_short_merge_FC1_L24_P12_R20_06081432"
+
+
+def test_run_dir_name_adds_round_suffix_when_missing(monkeypatch):
+    monkeypatch.setattr("forge.cli._run_timestamp", lambda: "06081433")
+
+    name = _run_dir_name("pilot_llm_FC1_FC2_L24_P12", 10, "forge")
+
+    assert name == "pilot_llm_FC1_FC2_L24_P12_R10_06081433"
 
 
 def test_continue_parser_accepts_resume_target():
@@ -724,7 +742,7 @@ def test_dispatch_patch_quality_rejects_noop_comment_patch():
     assert quality["reason"] == "motif_no_effect"
 
 
-def test_synthesis_patch_quality_accepts_small_real_delta():
+def test_synthesis_patch_quality_rejects_tiny_delta_noop():
     parent = "import torch\nclass ForgeModel:\n    def __init__(self):\n        self.head = 1.0\n"
     candidate = "import torch\nclass ForgeModel:\n    def __init__(self):\n        self.head = 0.95\n"
 
@@ -733,8 +751,8 @@ def test_synthesis_patch_quality_accepts_small_real_delta():
 
     assert motif_quality["passed"] is False
     assert motif_quality["reason"] == "motif_no_effect"
-    assert synthesis_quality["passed"] is True
-    assert synthesis_quality["reason"] == "synthesis_small_delta_quality_passed"
+    assert synthesis_quality["passed"] is False
+    assert synthesis_quality["reason"] == "motif_no_effect"
 
 
 def test_dispatch_patch_quality_rejects_destructive_transplant():
@@ -785,6 +803,60 @@ class ForgeModel:
 
     assert quality["passed"] is True
     assert quality["reason"] == "motif_quality_passed"
+
+
+def test_fragment_cards_prioritize_dual_metric_safe_motifs():
+    protected = {
+        "success": True,
+        "metrics": {
+            "paper_scaled": {"mae": 4.40, "mse": 10.00},
+            "target": {"mae_inverse": 0.00044},
+            "inverse": {"mse": 0.000001},
+        },
+    }
+    mae_only = {
+        "motif_id": "mae_only",
+        "component": "prediction_head",
+        "edit_action": "sharpen_mae",
+        "metric_delta": {
+            "target_relative": 0.20,
+            "mse_relative": -0.10,
+            "paper_mae": 0.30,
+            "paper_mse": -0.60,
+        },
+        "outcome_metrics": {"paper_mae": 4.20, "paper_mse": 10.80},
+        "diff_excerpt": "+        self.head_gate = torch.nn.Linear(8, 8)\n",
+    }
+    joint_safe = {
+        "motif_id": "joint_safe",
+        "component": "temporal_memory",
+        "edit_action": "smooth_joint",
+        "metric_delta": {
+            "target_relative": 0.08,
+            "mse_relative": 0.06,
+            "paper_mae": 0.08,
+            "paper_mse": 0.20,
+        },
+        "outcome_metrics": {"paper_mae": 4.36, "paper_mse": 9.90},
+        "diff_excerpt": "+        self.temporal_smoother = torch.nn.Linear(8, 8)\n",
+    }
+    trace = {
+        "trap_regions": [
+            {
+                "component": "prediction_head",
+                "edit_action": "sharpen_mae",
+                "invalid_count": 0,
+                "repeated_useless_count": 4,
+                "attempt_count": 5,
+            }
+        ]
+    }
+
+    cards = _build_fragment_cards([mae_only, joint_safe], protected, trace, limit=2)
+
+    assert cards[0]["motif_id"] == "joint_safe"
+    assert cards[0]["advantage_breakdown"]["joint_non_regressive_vs_parent"] is True
+    assert cards[1]["motif_id"] == "mae_only"
 
 
 def test_continue_target_defaults_to_one_more_round():

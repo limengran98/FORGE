@@ -54,6 +54,21 @@ def _timestamp() -> str:
     return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
 
+def _run_timestamp() -> str:
+    return datetime.utcnow().strftime("%m%d%H%M")
+
+
+def _run_dir_name(base_name: str | None, rounds: int, default_prefix: str) -> str:
+    name = str(base_name or default_prefix).strip() or default_prefix
+    name = re.sub(r"_\d{8}$", "", name)
+    name = re.sub(r"_\d{8}_\d{6}$", "", name)
+    if re.search(r"(?<=_)R\d+(?=_|$)", name):
+        name = re.sub(r"(?<=_)R\d+(?=_|$)", f"R{int(rounds)}", name)
+    else:
+        name = f"{name}_R{int(rounds)}"
+    return f"{name}_{_run_timestamp()}"
+
+
 def _device_label(cfg: HarnessConfig) -> str:
     if cfg.device == "cuda":
         return f"cuda:{cfg.cuda_id}"
@@ -994,7 +1009,74 @@ def _dispatch_winner_text(summary: dict[str, Any]) -> str:
     return f"{mode} selected {selected} ({metric_text}; accepted {accepted_count}/{candidate_count})"
 
 
+def _dispatch_final_model_text(summary: dict[str, Any]) -> str:
+    dispatch = summary.get("final_dispatch") or {}
+    if not dispatch:
+        return "not run"
+    selected = str(dispatch.get("selected") or "unknown")
+    selected_index = dispatch.get("selected_candidate_index")
+    metrics = dispatch.get("final_metrics") or (dispatch.get("protected_best") or {}).get("metrics") or {}
+    protected_metrics = (dispatch.get("protected_best") or {}).get("metrics") or {}
+    if selected == "candidate" and selected_index is not None:
+        source = f"candidate_{int(selected_index):02d}"
+    elif selected == "candidate":
+        source = "candidate"
+    else:
+        source = "protected_best"
+    mae = _safe_metric(metrics.get("paper_mae"))
+    mse = _safe_metric(metrics.get("paper_mse"))
+    protected_mae = _safe_metric(protected_metrics.get("paper_mae"))
+    protected_mse = _safe_metric(protected_metrics.get("paper_mse"))
+    gain_mae = _relative_improvement(protected_mae, mae) * 100.0
+    gain_mse = _relative_improvement(protected_mse, mse) * 100.0
+    paper_baseline = summary.get("paper_baseline") or dispatch.get("paper_baseline")
+    reference_text = ""
+    if paper_baseline:
+        delta = _paper_target_delta(
+            {
+                "success": True,
+                "metrics": {
+                    "paper_scaled": {"mae": mae, "mse": mse},
+                    "target": metrics.get("target") or {},
+                },
+            },
+            paper_baseline,
+        )
+        reference_text = (
+            f"; ref MAE {_format_signed_percent(delta.get('mae_improvement_pct'))}, "
+            f"MSE {_format_signed_percent(delta.get('mse_improvement_pct'))}"
+        )
+    return (
+        f"{source}: MAE {_format_metric(mae)}, MSE {_format_metric(mse)} "
+        f"(vs protected MAE {gain_mae:+.2f}%, MSE {gain_mse:+.2f}%{reference_text})"
+    )
+
+
 def _metric_verdict_text(summary: dict[str, Any]) -> str:
+    dispatch = summary.get("final_dispatch") or {}
+    paper_baseline = summary.get("paper_baseline") or dispatch.get("paper_baseline")
+    final_metrics = dispatch.get("final_metrics") if dispatch else None
+    if final_metrics and paper_baseline:
+        final_delta = _paper_target_delta(
+            {
+                "success": True,
+                "metrics": {
+                    "paper_scaled": {
+                        "mae": final_metrics.get("paper_mae"),
+                        "mse": final_metrics.get("paper_mse"),
+                    },
+                    "target": final_metrics.get("target") or {},
+                },
+            },
+            paper_baseline,
+        )
+        if final_delta.get("beats_both"):
+            return "Final model: MAE and MSE both improved"
+        if final_delta.get("beats_mae") and not final_delta.get("beats_mse"):
+            return "Final model: MAE improved, MSE regressed"
+        if final_delta.get("beats_mse") and not final_delta.get("beats_mae"):
+            return "Final model: MSE improved, MAE regressed"
+        return "Final model: reference not fully improved"
     tradeoff = summary.get("metric_tradeoff") or {}
     verdict = tradeoff.get("verdict")
     if verdict == "mae_mse_both_improved":
@@ -1041,6 +1123,7 @@ def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
         ("Joint-best", _selection_with_improvement_text(tradeoff.get("joint_reference_best"))),
         ("Protected best model", _selection_summary_text(final_selection)),
         ("Dispatch winner", _dispatch_winner_text(summary)),
+        ("Merged result", _dispatch_final_model_text(summary)),
         ("Final selection policy", f"{final_selection.get('policy', 'auto')} / {final_selection.get('selection', 'unknown')}"),
         ("Metric verdict", _metric_verdict_text(summary)),
         (
@@ -1061,6 +1144,49 @@ def _print_evidence_summary_table(summary: dict[str, Any]) -> None:
         ("Trace risk flags", _trace_risk_flags(trace)),
     ]
     _print_key_value_table("Concise evidence summary", rows)
+
+
+def _dispatch_table_summary(run_root: Path, dispatch_summary: dict[str, Any]) -> dict[str, Any]:
+    run_summary_path = run_root / "summary.json"
+    if run_summary_path.exists():
+        try:
+            summary = load_json(run_summary_path)
+        except Exception:
+            summary = {}
+    else:
+        summary = {}
+    if not summary:
+        protected = dispatch_summary.get("protected_best") or {}
+        audit = dispatch_summary.get("evidence_audit") or {}
+        tables = audit.get("tables") or {}
+        summary = {
+            "run_root": str(run_root),
+            "target_metric": dispatch_summary.get("target_metric"),
+            "paper_baseline": dispatch_summary.get("paper_baseline"),
+            "best_iteration": protected.get("iteration"),
+            "best_metrics": protected.get("metrics") or {},
+            "paper_delta": protected.get("paper_delta") or {},
+            "metric_tradeoff": {},
+            "final_selection": {
+                "policy": (protected.get("final_selection_policy") or "auto"),
+                "selection": protected.get("selection") or "protected_best",
+                "iteration": protected.get("iteration"),
+                "metrics": protected.get("metrics") or {},
+            },
+            "evidence_audit": audit,
+            "evidence_artifacts": {
+                "table_counts": {
+                    name: len(rows) if isinstance(rows, list) else 0
+                    for name, rows in tables.items()
+                }
+            },
+        }
+    summary["final_dispatch"] = _compact_dispatch_summary(dispatch_summary)
+    return summary
+
+
+def _print_dispatch_summary_table(run_root: Path, dispatch_summary: dict[str, Any]) -> None:
+    _print_evidence_summary_table(_dispatch_table_summary(run_root, dispatch_summary))
 
 
 def _safe_metric(value: Any, default: float = float("inf")) -> float:
@@ -1651,6 +1777,23 @@ def _mine_motifs_from_run(
             + 0.05 * max(0.0, paper_mae_delta)
             + 0.01 * max(0.0, paper_mse_delta)
         )
+        diff_excerpt = _read_text_excerpt(patch_record.get("diff_path"), source_root, max_diff_chars)
+        try:
+            parent_model_path = _iteration_source_path(parent_row, source_root)
+            outcome_model_path = _iteration_source_path(outcome_row, source_root)
+            parent_source_hash = _source_hash(read_model_source(parent_model_path)) if parent_model_path.exists() else None
+            outcome_source_hash = _source_hash(read_model_source(outcome_model_path)) if outcome_model_path.exists() else None
+        except Exception:
+            parent_model_path = None
+            outcome_model_path = None
+            parent_source_hash = None
+            outcome_source_hash = None
+        changed_lines = [
+            line[1:]
+            for line in diff_excerpt.splitlines()
+            if (line.startswith("+") and not line.startswith("+++"))
+            or (line.startswith("-") and not line.startswith("---"))
+        ]
         motif_id = (
             f"{source_root.name}:patch_{patch_iteration:03d}_to_iter_{outcome_iteration:03d}:"
             f"{patch_record.get('component') or 'unknown'}:{patch_record.get('edit_action') or 'unknown'}"
@@ -1674,10 +1817,16 @@ def _mine_motifs_from_run(
                     "mse_relative": mse_delta,
                     "paper_mae": paper_mae_delta,
                     "paper_mse": paper_mse_delta,
+                    "joint_non_regressive_vs_parent": target_delta >= -1e-12 and mse_delta >= -1e-12,
                 },
                 "parent_metrics": _paper_metric_summary(parent_result),
                 "outcome_metrics": _paper_metric_summary(outcome_result),
-                "diff_excerpt": _read_text_excerpt(patch_record.get("diff_path"), source_root, max_diff_chars),
+                "parent_model_path": str(parent_model_path) if parent_model_path else None,
+                "outcome_model_path": str(outcome_model_path) if outcome_model_path else None,
+                "parent_source_hash": parent_source_hash,
+                "outcome_source_hash": outcome_source_hash,
+                "changed_self_names": sorted(_self_names(changed_lines)),
+                "diff_excerpt": diff_excerpt,
             }
         )
     return motifs
@@ -1763,6 +1912,381 @@ def _mine_archive_model_candidates(
         "total_mined": len(candidates),
         "candidates": candidates[: max(0, int(limit))],
     }
+
+
+def _previous_dispatch_winner_candidates(
+    run_root: Path,
+    protected_source: str,
+    target_metric: str,
+    limit: int = 4,
+) -> dict[str, Any]:
+    protected_hash = _source_hash(protected_source)
+    seen_hashes = {protected_hash}
+    candidates: list[dict[str, Any]] = []
+    for summary_path in sorted(run_root.glob("evidence_dispatch*/dispatch_summary.json")):
+        try:
+            summary = load_json(summary_path)
+        except Exception:
+            continue
+        if summary.get("selected") != "candidate" and int(summary.get("accepted_count") or 0) <= 0:
+            continue
+        final_model_path = summary.get("final_model_path")
+        if not final_model_path:
+            continue
+        resolved_model_path = _resolve_stored_path(final_model_path, run_root)
+        if not resolved_model_path.exists():
+            continue
+        try:
+            source = read_model_source(resolved_model_path)
+        except Exception:
+            continue
+        source_hash = _source_hash(source)
+        if source_hash in seen_hashes:
+            continue
+        seen_hashes.add(source_hash)
+        selected_result_path = resolved_model_path.parent / "selected_result.json"
+        result = load_json(selected_result_path) if selected_result_path.exists() else {}
+        metrics = summary.get("final_metrics") or _paper_metric_summary(result)
+        candidates.append(
+            {
+                "archive_id": f"{summary_path.parent.name}:final_candidate",
+                "source_run_root": str(run_root),
+                "dispatch_dir": str(summary_path.parent),
+                "summary_path": str(summary_path),
+                "model_path": str(resolved_model_path),
+                "source_hash": source_hash,
+                "metrics": metrics,
+                "paper_mae": _safe_metric(metrics.get("paper_mae")),
+                "paper_mse": _safe_metric(metrics.get("paper_mse")),
+                "target_metric_value": _safe_metric((metrics.get("target") or {}).get(target_metric)),
+                "selected_candidate_index": summary.get("selected_candidate_index"),
+                "accepted_count": int(summary.get("accepted_count") or 0),
+                "source_kind": "previous_dispatch_winner",
+            }
+        )
+    candidates = sorted(candidates, key=lambda row: (row["paper_mae"], row["paper_mse"], row["target_metric_value"]))
+    return {
+        "sources": [str(run_root)],
+        "total_mined": len(candidates),
+        "candidates": candidates[: max(0, int(limit))],
+    }
+
+
+def _recent_effective_improvement_row(
+    history: list[dict[str, Any]],
+    state: dict[str, Any],
+    target_metric: str,
+) -> dict[str, Any] | None:
+    rows_by_iter = {int(row["iteration"]): row for row in history}
+    for outcome_iteration in sorted(rows_by_iter, reverse=True):
+        if outcome_iteration <= 0:
+            continue
+        outcome_row = rows_by_iter[outcome_iteration]
+        outcome_result = outcome_row.get("result") or {}
+        if not outcome_result.get("success"):
+            continue
+        patch_record = state.get("iterations", {}).get(f"iter_{outcome_iteration - 1:03d}", {}).get("patch", {})
+        if not patch_record or patch_record.get("validation_fallback"):
+            continue
+        parent_iteration = patch_record.get("parent_iteration")
+        parent_row = rows_by_iter.get(int(parent_iteration)) if parent_iteration is not None else rows_by_iter.get(outcome_iteration - 1)
+        parent_result = parent_row.get("result", {}) if parent_row else {}
+        if not parent_result.get("success"):
+            continue
+        target_delta = _relative_improvement(
+            _target_metric_value(parent_result, target_metric),
+            _target_metric_value(outcome_result, target_metric),
+        )
+        mse_delta = _relative_improvement(_inverse_mse_value(parent_result), _inverse_mse_value(outcome_result))
+        paper_mae_delta = _finite_delta(_paper_mae_value(parent_result), _paper_mae_value(outcome_result))
+        paper_mse_delta = _finite_delta(_paper_mse_value(parent_result), _paper_mse_value(outcome_result))
+        if (target_delta > 0 or mse_delta > 0 or paper_mae_delta > 0 or paper_mse_delta > 0) and paper_mae_delta >= -1e-12 and paper_mse_delta >= -1e-12:
+            return outcome_row
+    return None
+
+
+def _history_model_card(
+    role: str,
+    row: dict[str, Any] | None,
+    run_root: Path,
+    paper_baseline: dict[str, Any] | None,
+    target_metric: str,
+) -> dict[str, Any] | None:
+    if not row:
+        return None
+    result = row.get("result") or {}
+    if not result.get("success"):
+        return None
+    model_path = _iteration_source_path(row, run_root)
+    try:
+        source_hash = _source_hash(read_model_source(model_path)) if model_path.exists() else None
+    except Exception:
+        source_hash = None
+    return {
+        "role": role,
+        "source_kind": "trajectory_iteration",
+        "iteration": int(row["iteration"]),
+        "model_path": str(model_path),
+        "source_hash": source_hash,
+        "metrics": _paper_metric_summary(result),
+        "reference_delta": _paper_target_delta(result, paper_baseline),
+        "target_metric": target_metric,
+        "route": row.get("route") or {},
+        "diagnostic_probes": _diagnostic_probe_map(row.get("feedback") or {}),
+    }
+
+
+def _dispatch_winner_model_card(
+    role: str,
+    winner: dict[str, Any],
+    paper_baseline: dict[str, Any] | None,
+    target_metric: str,
+) -> dict[str, Any]:
+    result = {"success": True, "metrics": {"paper_scaled": {}}}
+    metrics = winner.get("metrics") or {}
+    result["metrics"]["paper_scaled"] = {
+        "mae": metrics.get("paper_mae"),
+        "mse": metrics.get("paper_mse"),
+    }
+    result["metrics"]["target"] = metrics.get("target") or {}
+    return {
+        "role": role,
+        "source_kind": winner.get("source_kind") or "previous_dispatch_winner",
+        "dispatch_dir": winner.get("dispatch_dir"),
+        "model_path": winner.get("model_path"),
+        "source_hash": winner.get("source_hash"),
+        "metrics": metrics,
+        "reference_delta": _paper_target_delta(result, paper_baseline),
+        "target_metric": target_metric,
+        "selected_candidate_index": winner.get("selected_candidate_index"),
+        "accepted_count": winner.get("accepted_count"),
+    }
+
+
+def _merge_triage_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    by_key: dict[str, dict[str, Any]] = {}
+    for card in cards:
+        key = str(card.get("source_hash") or card.get("model_path") or card.get("role"))
+        if key in by_key:
+            target = by_key[key]
+            target.setdefault("roles", [target.get("role")])
+            target["roles"].append(card.get("role"))
+            continue
+        copied = dict(card)
+        copied["roles"] = [card.get("role")]
+        by_key[key] = copied
+        merged.append(copied)
+    return merged
+
+
+def _build_triage_model_cards(
+    history: list[dict[str, Any]],
+    run_root: Path,
+    target_metric: str,
+    paper_baseline: dict[str, Any] | None,
+    protected_row: dict[str, Any],
+    state: dict[str, Any],
+    previous_dispatch_winners: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    joint_row, _joint_name, _joint_reason = _metric_aware_final_row(history, target_metric, paper_baseline, "joint")
+    roles = [
+        ("protected_best", protected_row),
+        ("mae_best", _best_by_paper_metric(history, "mae")),
+        ("mse_best", _best_by_paper_metric(history, "mse")),
+        ("joint_best", joint_row),
+        ("recent_effective_improvement", _recent_effective_improvement_row(history, state, target_metric)),
+    ]
+    cards = [
+        card
+        for role, row in roles
+        for card in [_history_model_card(role, row, run_root, paper_baseline, target_metric)]
+        if card
+    ]
+    for index, winner in enumerate(previous_dispatch_winners[:2]):
+        cards.append(
+            _dispatch_winner_model_card(
+                f"previous_dispatch_winner_{index}",
+                winner,
+                paper_baseline,
+                target_metric,
+            )
+        )
+    return _merge_triage_cards(cards)
+
+
+def _motif_pollution(motif: dict[str, Any], trace_consolidation: dict[str, Any]) -> dict[str, Any]:
+    component = motif.get("component")
+    edit_action = motif.get("edit_action")
+    matches = [
+        row for row in trace_consolidation.get("trap_regions") or []
+        if row.get("component") == component and row.get("edit_action") == edit_action
+    ]
+    invalid = sum(int(row.get("invalid_count") or 0) for row in matches)
+    repeated = sum(int(row.get("repeated_useless_count") or 0) for row in matches)
+    attempts = sum(int(row.get("attempt_count") or 0) for row in matches)
+    return {
+        "matched_trap_regions": len(matches),
+        "invalid_count": invalid,
+        "repeated_useless_count": repeated,
+        "attempt_count": attempts,
+        "risk_penalty": 0.4 * invalid + 0.25 * repeated + 0.05 * attempts,
+    }
+
+
+def _dual_metric_advantage(
+    motif: dict[str, Any],
+    protected_result: dict[str, Any],
+    trace_consolidation: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    delta = motif.get("metric_delta") or {}
+    target_delta = _safe_metric(delta.get("target_relative"), 0.0)
+    mse_delta = _safe_metric(delta.get("mse_relative"), 0.0)
+    paper_mae_delta = _safe_metric(delta.get("paper_mae"), 0.0)
+    paper_mse_delta = _safe_metric(delta.get("paper_mse"), 0.0)
+    outcome_metrics = motif.get("outcome_metrics") or {}
+    protected_mae = _paper_mae_value(protected_result)
+    protected_mse = _paper_mse_value(protected_result)
+    outcome_mae = _safe_metric(outcome_metrics.get("paper_mae"))
+    outcome_mse = _safe_metric(outcome_metrics.get("paper_mse"))
+    protected_relative_mae = _relative_improvement(protected_mae, outcome_mae)
+    protected_relative_mse = _relative_improvement(protected_mse, outcome_mse)
+    pollution = _motif_pollution(motif, trace_consolidation)
+    joint_non_regressive = (
+        target_delta >= -1e-12
+        and mse_delta >= -1e-12
+        and paper_mae_delta >= -1e-12
+        and paper_mse_delta >= -1e-12
+    )
+    score = (
+        2.0 * max(0.0, target_delta)
+        + 1.2 * max(0.0, mse_delta)
+        + 0.08 * max(0.0, paper_mae_delta)
+        + 0.03 * max(0.0, paper_mse_delta)
+        + 1.5 * max(0.0, protected_relative_mae)
+        + 1.0 * max(0.0, protected_relative_mse)
+        - 2.0 * max(0.0, -target_delta)
+        - 1.2 * max(0.0, -mse_delta)
+        - 0.25 * max(0.0, -paper_mae_delta)
+        - 0.08 * max(0.0, -paper_mse_delta)
+        - pollution["risk_penalty"]
+    )
+    if joint_non_regressive:
+        score += 0.4
+    return score, {
+        "target_relative": target_delta,
+        "mse_relative": mse_delta,
+        "paper_mae_delta": paper_mae_delta,
+        "paper_mse_delta": paper_mse_delta,
+        "protected_relative_mae": protected_relative_mae,
+        "protected_relative_mse": protected_relative_mse,
+        "joint_non_regressive_vs_parent": joint_non_regressive,
+        "pollution": pollution,
+    }
+
+
+def _build_fragment_cards(
+    motifs: list[dict[str, Any]],
+    protected_result: dict[str, Any],
+    trace_consolidation: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for motif in motifs:
+        diff_excerpt = str(motif.get("diff_excerpt") or "").strip()
+        if not diff_excerpt:
+            continue
+        key = f"{motif.get('outcome_source_hash') or motif.get('motif_id')}:{motif.get('component')}:{motif.get('edit_action')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        advantage, advantage_breakdown = _dual_metric_advantage(motif, protected_result, trace_consolidation)
+        changed_self_names = motif.get("changed_self_names") or []
+        if not changed_self_names:
+            changed_self_names = sorted(_self_names(diff_excerpt.splitlines()))
+        cards.append(
+            {
+                "fragment_id": f"fragment_{len(cards):03d}",
+                "motif_id": motif.get("motif_id"),
+                "source_run_root": motif.get("source_run_root"),
+                "patch_iteration": motif.get("patch_iteration"),
+                "parent_iteration": motif.get("parent_iteration"),
+                "outcome_iteration": motif.get("outcome_iteration"),
+                "component": motif.get("component"),
+                "edit_action": motif.get("edit_action"),
+                "summary": motif.get("summary"),
+                "origin": motif.get("origin"),
+                "dual_metric_advantage": advantage,
+                "advantage_breakdown": advantage_breakdown,
+                "changed_self_names": changed_self_names,
+                "parent_metrics": motif.get("parent_metrics"),
+                "outcome_metrics": motif.get("outcome_metrics"),
+                "parent_model_path": motif.get("parent_model_path"),
+                "outcome_model_path": motif.get("outcome_model_path"),
+                "outcome_source_hash": motif.get("outcome_source_hash"),
+                "diff_excerpt": diff_excerpt,
+                "transplant_contract": {
+                    "fork_from": "protected_best",
+                    "allowed_change": "transplant_only_this_successful_fragment_with_boundary_adaptation",
+                    "reject_if": [
+                        "no effective code difference from protected best",
+                        "target component not changed",
+                        "MAE or MSE regresses under the fixed harness",
+                        "tensor shape/interface contract changes",
+                    ],
+                    "expected_effect": "preserve protected best while importing the fragment's dual-metric advantage",
+                },
+            }
+        )
+    cards = sorted(
+        cards,
+        key=lambda row: (
+            not bool((row.get("advantage_breakdown") or {}).get("joint_non_regressive_vs_parent")),
+            -_safe_metric(row.get("dual_metric_advantage"), 0.0),
+            _safe_metric((row.get("outcome_metrics") or {}).get("paper_mae")),
+            _safe_metric((row.get("outcome_metrics") or {}).get("paper_mse")),
+        ),
+    )
+    return cards[: max(0, int(limit))]
+
+
+def _compact_fragment_card(card: dict[str, Any], max_diff_chars: int = 5000) -> dict[str, Any]:
+    compact = dict(card)
+    compact["diff_excerpt"] = _truncate_for_report(str(card.get("diff_excerpt") or ""), max_diff_chars)
+    return compact
+
+
+def _fragment_synthesis_variants(fragment_cards: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    variants: list[dict[str, Any]] = []
+    for index, card in enumerate(fragment_cards[: max(0, int(limit))]):
+        variants.append(
+            {
+                "variant_id": f"fragment_transplant_{index:02d}",
+                "objective": (
+                    "Transplant the selected real successful diff fragment onto protected_best. "
+                    "The LLM may only adapt tensor/name boundaries needed to make this exact fragment executable."
+                ),
+                "selected_fragment": card,
+                "positive_evidence": [card],
+                "avoid_evidence": (card.get("advantage_breakdown") or {}).get("pollution") or {},
+                "risk_posture": "prefix_fork_fragment_transplant",
+                "acceptance_hint": "The candidate is accepted only by fixed-harness MAE/MSE non-regression and executable improvement.",
+            }
+        )
+    return variants
+
+
+def _compact_synthesis_variant(variant: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(variant)
+    if compact.get("selected_fragment"):
+        compact["selected_fragment"] = _compact_fragment_card(compact["selected_fragment"])
+    if compact.get("positive_evidence"):
+        compact["positive_evidence"] = [
+            _compact_fragment_card(row) if isinstance(row, dict) and row.get("fragment_id") else row
+            for row in compact.get("positive_evidence") or []
+        ]
+    return compact
 
 
 def _compact_patch_meta(patch_meta: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1861,15 +2385,6 @@ def _synthesis_patch_quality(parent_source: str, candidate_source: str) -> dict[
     if quality["passed"]:
         quality["reason"] = "synthesis_" + str(quality["reason"])
         return quality
-    if quality["reason"] != "motif_no_effect":
-        return quality
-    meaningful_total = int(quality.get("meaningful_added") or 0) + int(quality.get("meaningful_removed") or 0)
-    source_changed = _source_hash(parent_source) != _source_hash(candidate_source)
-    destructive_count = len(quality.get("destructively_removed_self_names") or [])
-    if source_changed and meaningful_total >= 2 and destructive_count <= 2:
-        quality = dict(quality)
-        quality["passed"] = True
-        quality["reason"] = "synthesis_small_delta_quality_passed"
     return quality
 
 
@@ -1940,6 +2455,9 @@ def _compact_motif_for_report(motif: dict[str, Any]) -> dict[str, Any]:
         "metric_delta": motif.get("metric_delta"),
         "parent_metrics": motif.get("parent_metrics"),
         "outcome_metrics": motif.get("outcome_metrics"),
+        "parent_model_path": motif.get("parent_model_path"),
+        "outcome_model_path": motif.get("outcome_model_path"),
+        "changed_self_names": motif.get("changed_self_names"),
         "diff_excerpt": _truncate_for_report(motif.get("diff_excerpt", "")),
     }
 
@@ -2124,7 +2642,15 @@ def _compact_synthesis_payload(
             "strategy_memory": audit.get("strategy_memory", {}),
         },
         "trace_consolidation": _compact_trace_consolidation(audit.get("trace_consolidation") or {}),
-        "synthesis_variant": variant,
+        "synthesis_variant": _compact_synthesis_variant(variant),
+        "triage_models": payload.get("triage_models") or [],
+        "selected_fragment": _compact_fragment_card(variant.get("selected_fragment") or {})
+        if variant.get("selected_fragment")
+        else None,
+        "fragment_cards": [
+            _compact_fragment_card(card, max_diff_chars=1800)
+            for card in (payload.get("fragment_cards") or [])[:max_motifs]
+        ],
         "trajectory_evidence": {
             "accepted_improvements": (evidence.get("accepted_improvements") or [])[:6],
             "rejected_or_failed_attempts": (evidence.get("rejected_or_failed_attempts") or [])[:6],
@@ -2395,7 +2921,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Stable FORGE currently executes one candidate per round; keep --candidate-tournament-k 1")
     hcfg = _harness_config_from_args(args, exp_cfg)
 
-    run_name = args.run_name or f"forge_{_timestamp()}"
+    run_name = _run_dir_name(args.run_name, rounds, "forge")
     run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (RUNS_DIR / run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     save_json(
@@ -3077,7 +3603,32 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         candidate_tournament_k=max(1, dispatch_candidate_limit or 1),
     )
     trace_consolidation = evidence_audit.get("trace_consolidation") or {}
-    synthesis_variants = _trace_synthesis_variants(trace_consolidation, dispatch_candidate_limit) if dispatch_mode == "synthesis" else []
+    previous_dispatch_library = _previous_dispatch_winner_candidates(
+        run_root,
+        protected_source,
+        target_metric,
+        limit=min(2, max(0, dispatch_candidate_limit)),
+    )
+    triage_model_cards = _build_triage_model_cards(
+        history,
+        run_root,
+        target_metric,
+        paper_baseline,
+        protected_row,
+        orchestrator.state,
+        previous_dispatch_library["candidates"],
+    )
+    fragment_cards = _build_fragment_cards(
+        motif_library["motifs"],
+        protected_result,
+        trace_consolidation,
+        limit=max(int(args.evidence_limit), dispatch_candidate_limit * 2),
+    )
+    planned_previous_winners = previous_dispatch_library["candidates"][: min(2, dispatch_candidate_limit)] if dispatch_mode == "synthesis" else []
+    remaining_synthesis_budget = max(0, dispatch_candidate_limit - len(planned_previous_winners))
+    synthesis_variants = []
+    if dispatch_mode == "synthesis":
+        synthesis_variants = _fragment_synthesis_variants(fragment_cards, remaining_synthesis_budget)
     if dispatch_mode == "summary":
         dispatch_objective = (
             "Summarize current-run PEMFC refinement evidence and keep the protected best "
@@ -3085,9 +3636,9 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         )
     elif dispatch_mode == "synthesis":
         dispatch_objective = (
-            "Generate outcome-calibrated trace synthesis candidates from productive core, "
-            "trap region, and repair path evidence. Each candidate is accepted only if the "
-            "fixed harness improves on protected_best without MAE/MSE regression."
+            "Generate prefix-fork fragment transplant candidates from real successful trajectory "
+            "diffs ranked by dual-metric advantage and pollution risk. Each candidate is accepted "
+            "only if the fixed harness improves on protected_best without MAE/MSE regression."
         )
     else:
         dispatch_objective = (
@@ -3102,6 +3653,8 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_audit": evidence_audit,
         "trace_consolidation": trace_consolidation,
         "synthesis_variants": synthesis_variants,
+        "triage_models": triage_model_cards,
+        "fragment_cards": [_compact_fragment_card(card) for card in fragment_cards],
         "protected_best": {
             "iteration": protected_iteration,
             "selection": protected_selection_name,
@@ -3117,10 +3670,12 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         "trajectory_evidence": evidence,
         "motif_library": motif_library,
         "archive_model_library": archive_library,
+        "previous_dispatch_winner_library": previous_dispatch_library,
         "acceptance_policy": {
             "protected_best_is_default_final": True,
             "summary_only_no_candidate_training": dispatch_mode == "summary",
             "synthesis_candidate_training": dispatch_mode == "synthesis",
+            "synthesis_is_prefix_fork_fragment_transplant": dispatch_mode == "synthesis",
             "candidate_must_pass_same_harness": True,
             "candidate_must_not_regress_target_metric": target_metric,
             "candidate_must_not_regress_inverse_mse": True,
@@ -3146,7 +3701,10 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[FORGE] Evidence Dispatch motif sources: {len(motif_library['sources'])}")
     print(f"[FORGE] Evidence Dispatch motifs mined: {motif_library['total_mined']}")
     if dispatch_mode == "synthesis":
-        print(f"[FORGE] Evidence Synthesis candidates planned: {len(synthesis_variants)}")
+        print(f"[FORGE] Evidence Synthesis triage models: {len(triage_model_cards)}")
+        print(f"[FORGE] Evidence Synthesis fragment cards: {len(fragment_cards)}")
+        print(f"[FORGE] Evidence Synthesis previous winners planned: {len(planned_previous_winners)}")
+        print(f"[FORGE] Evidence Synthesis candidates planned: {len(planned_previous_winners) + len(synthesis_variants)}")
     if dispatch_mode == "candidates":
         print(f"[FORGE] Evidence Dispatch archive models mined: {archive_library['total_mined']}")
     if paper_baseline:
@@ -3209,12 +3767,15 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 "used_count": len(motifs_for_report),
                 "motifs": motifs_for_report,
             },
+            "triage_models": triage_model_cards,
+            "fragment_cards": [_compact_fragment_card(card) for card in fragment_cards],
             "archive_model_library": {
                 "sources": archive_library["sources"],
                 "total_mined": archive_library["total_mined"],
                 "used_count": 0,
                 "candidates": [],
             },
+            "previous_dispatch_winner_library": previous_dispatch_library,
             "candidates": [],
             "accepted_count": 0,
             "candidate_count": 0,
@@ -3234,18 +3795,68 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[FORGE] Dispatch report: {dispatch_dir / 'dispatch_report.json'}")
         print(f"[FORGE] Dispatch summary: {dispatch_dir / 'dispatch_summary.json'}")
         print(f"[FORGE] Final model: {final_model_path}")
+        if not bool(getattr(args, "suppress_metric_summary", False)):
+            _print_dispatch_summary_table(run_root, summary)
         return summary
 
     candidate_records: list[dict[str, Any]] = []
     next_candidate_index = 0
     motifs = motif_library["motifs"][:dispatch_candidate_limit]
     if dispatch_mode == "synthesis":
-        if llm_cfg is None:
+        for archive in planned_previous_winners:
+            archive_source = read_model_source(_resolve_stored_path(archive["model_path"], run_root))
+            archive_candidate = PatchCandidate(
+                source=archive_source,
+                rationale=(
+                    "A previous Evidence Dispatch candidate already passed the fixed harness. "
+                    "Re-evaluate it as a prefix-fork tournament candidate so it is not lost from memory."
+                ),
+                summary=f"Re-promote previous dispatch winner {archive['archive_id']}.",
+                component="previous_dispatch_winner",
+                origin="archive_model",
+                edit_action="promote_previous_dispatch_winner",
+                raw_response={"previous_dispatch_winner": archive},
+            )
+            archive_motif = {
+                "motif_id": archive["archive_id"],
+                "type": "previous_dispatch_winner_promotion",
+                "source_run_root": archive["source_run_root"],
+                "dispatch_dir": archive.get("dispatch_dir"),
+                "model_path": archive["model_path"],
+                "metrics": archive["metrics"],
+            }
+            candidate_records.append(
+                _evaluate_dispatch_candidate(
+                    candidate_index=next_candidate_index,
+                    candidate=archive_candidate,
+                    candidate_dir=candidates_dir / f"candidate_{next_candidate_index:02d}_previous_dispatch",
+                    protected_copy=protected_copy,
+                    protected_source=protected_source,
+                    protected_iteration=protected_iteration,
+                    protected_result=protected_result,
+                    protected_feedback=protected_feedback,
+                    protected_route=protected_row.get("route") or {},
+                    history=history,
+                    hcfg=hcfg,
+                    target_metric=target_metric,
+                    target_diagnostics=target_diagnostics,
+                    paper_baseline=paper_baseline,
+                    llm_cfg=llm_cfg,
+                    max_repair_rounds=0,
+                    motif=archive_motif,
+                    min_relative_improvement=float(args.min_relative_improvement),
+                )
+            )
+            next_candidate_index += 1
+
+        if remaining_synthesis_budget <= 0:
+            pass
+        elif llm_cfg is None:
             if llm_mode == "required":
                 raise RuntimeError("Evidence Synthesis requires an LLM config, but none was available")
         elif not synthesis_variants:
             if llm_mode == "required":
-                raise RuntimeError("Evidence Synthesis required trace variants, but no trace evidence was available")
+                raise RuntimeError("Evidence Synthesis required real successful fragment evidence, but no fragment cards were available")
         else:
             for variant in synthesis_variants:
                 index = next_candidate_index
@@ -3253,7 +3864,7 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     payload,
                     variant,
                     candidate_index=index,
-                    candidate_count=len(synthesis_variants),
+                    candidate_count=len(planned_previous_winners) + len(synthesis_variants),
                 )
                 synthesis_motif = {
                     "motif_id": f"trace_synthesis_{index:02d}_{variant.get('variant_id', 'variant')}",
@@ -3458,11 +4069,19 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "used_count": len(motifs),
             "motifs": motifs,
         },
+        "triage_models": triage_model_cards,
+        "fragment_cards": [_compact_fragment_card(card) for card in fragment_cards],
         "archive_model_library": {
             "sources": archive_library["sources"],
             "total_mined": archive_library["total_mined"],
             "used_count": len(archive_library["candidates"]),
             "candidates": archive_library["candidates"],
+        },
+        "previous_dispatch_winner_library": {
+            "sources": previous_dispatch_library["sources"],
+            "total_mined": previous_dispatch_library["total_mined"],
+            "used_count": len(planned_previous_winners),
+            "candidates": planned_previous_winners,
         },
         "candidates": compact_candidates,
         "accepted_count": len(accepted_records),
@@ -3489,6 +4108,8 @@ def cmd_dispatch(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[FORGE] Evidence Synthesis winner: {winner}")
     print(f"[FORGE] Dispatch summary: {dispatch_dir / 'dispatch_summary.json'}")
     print(f"[FORGE] Final model: {final_model_path}")
+    if not bool(getattr(args, "suppress_metric_summary", False)):
+        _print_dispatch_summary_table(run_root, summary)
     return summary
 
 
@@ -3563,7 +4184,7 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     target_metric = args.target_metric or exp_cfg["evolution"]["target_metric"]
     rounds = int(args.rounds if args.rounds is not None else exp_cfg["evolution"]["rounds"])
     llm_mode = args.llm_mode or exp_cfg["evolution"]["llm_mode"]
-    sweep_name = args.run_name or f"forge_sweep_{_timestamp()}"
+    sweep_name = _run_dir_name(args.run_name, rounds, "forge_sweep")
     sweep_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (RUNS_DIR / sweep_name).resolve()
     sweep_root.mkdir(parents=True, exist_ok=True)
 
